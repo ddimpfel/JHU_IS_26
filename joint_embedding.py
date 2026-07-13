@@ -1,21 +1,16 @@
 from typing import Literal, Optional
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
 
 
-FeatureSource = Literal["embedding", "backbone"]
 BackboneName = Literal[
-    "resnet18",
-    "resnet50",
     "mobilenet_v3_small",
     "mobilenet_v3_large",
     "convnext_tiny",
     "convnext_small",
 ]
-LossType = Literal["supcon", "ntxent", "triplet"]
 
 
 # =========================================================================================
@@ -60,26 +55,17 @@ class JointEmbeddingBackbone(nn.Module):
     def __init__(
         self,
         num_classes: int,
-        backbone: BackboneName = "resnet18",
+        backbone: BackboneName = "mobilenet_v3_small",
         embedding_dim: int = 128,
         projection_dim: int = 128,
         pretrained: bool = True,
-        expert_feature_source: FeatureSource = "embedding",
-        router_feature_source: FeatureSource = "embedding",
     ) -> None:
         super().__init__()
-
-        if expert_feature_source not in {"embedding", "backbone"}:
-            raise ValueError("expert_feature_source must be 'embedding' or 'backbone'")
-        if router_feature_source not in {"embedding", "backbone"}:
-            raise ValueError("router_feature_source must be 'embedding' or 'backbone'")
 
         self.num_classes = num_classes
         self.backbone_name = backbone
         self.embedding_dim = embedding_dim
         self.projection_dim = projection_dim
-        self.expert_feature_source = expert_feature_source
-        self.router_feature_source = router_feature_source
 
         self.feature_encoder, self.backbone_feature_dim = self._build_feature_encoder(
             backbone=backbone,
@@ -98,41 +84,13 @@ class JointEmbeddingBackbone(nn.Module):
             output_dim=projection_dim,
         )
 
-        classifier_input_dim = self._feature_dim_for(router_feature_source)
-        self.classification_head = nn.Linear(classifier_input_dim, num_classes)
-        self.expert_feature_dim = self._feature_dim_for(expert_feature_source)
-        self.router_feature_dim = classifier_input_dim
-
-    def _feature_dim_for(self, source: FeatureSource) -> int:
-        if source == "embedding":
-            return self.embedding_dim
-        return self.backbone_feature_dim
+        self.classification_head = nn.Linear(self.embedding_dim, num_classes)
 
     def _build_feature_encoder(
         self,
         backbone: BackboneName,
         pretrained: bool,
     ) -> tuple[nn.Module, int]:
-        if backbone == "resnet18":
-            model = self._load_torchvision_model(
-                builder=models.resnet18,
-                weights_enum_name="ResNet18_Weights",
-                pretrained=pretrained,
-            )
-            encoder = nn.Sequential(*list(model.children())[:-1])
-            feature_dim = 512
-            return encoder, feature_dim
-
-        if backbone == "resnet50":
-            model = self._load_torchvision_model(
-                builder=models.resnet50,
-                weights_enum_name="ResNet50_Weights",
-                pretrained=pretrained,
-            )
-            encoder = nn.Sequential(*list(model.children())[:-1])
-            feature_dim = 2048
-            return encoder, feature_dim
-
         if backbone == "mobilenet_v3_small":
             model = self._load_torchvision_model(
                 builder=models.mobilenet_v3_small,
@@ -197,24 +155,13 @@ class JointEmbeddingBackbone(nn.Module):
         backbone_features = torch.flatten(backbone_features, 1)
         embeddings = self.embedding_head(backbone_features)
         projections = self.projection_head(embeddings)
-
-        router_features = embeddings
-        if self.router_feature_source == "backbone":
-            router_features = backbone_features
-
-        expert_features = embeddings
-        if self.expert_feature_source == "backbone":
-            expert_features = backbone_features
-
-        logits = self.classification_head(router_features)
+        logits = self.classification_head(embeddings)
 
         return {
             "logits": logits,
-            "features": expert_features,
             "embeddings": embeddings,
             "backbone_features": backbone_features,
             "projections": projections,
-            "router_features": router_features,
         }
 
     def forward(self, x: torch.Tensor, return_features: bool = True):
@@ -223,7 +170,7 @@ class JointEmbeddingBackbone(nn.Module):
         if not return_features:
             return outputs["logits"]
 
-        return outputs["logits"], outputs["features"]
+        return outputs["logits"], outputs["projections"]
 
 
 # =========================================================================================
@@ -238,6 +185,9 @@ class SupervisedContrastiveLoss(nn.Module):
     This is the objective that best matches the current continual-learning study:
     it uses class labels to compact same-class samples and separate different classes,
     which is directly aligned with reducing interference across tasks.
+    
+    This is similar to soft nearest-neighbor loss by comparing multiple positive and
+    negative samples together.
     """
 
     def __init__(self, temperature: float = 0.07, eps: float = 1e-12) -> None:
@@ -272,6 +222,7 @@ class SupervisedContrastiveLoss(nn.Module):
         positive_count = positive_mask.sum(dim=1)
         valid_rows = positive_count > 0
         if not torch.any(valid_rows):
+            print("no valid rows found")
             return embeddings.new_zeros(())
 
         mean_log_prob_pos = (
@@ -279,40 +230,6 @@ class SupervisedContrastiveLoss(nn.Module):
             / positive_count[valid_rows]
         )
         return -mean_log_prob_pos.mean()
-
-
-class NTXentLoss(nn.Module):
-    """
-    Two-view InfoNCE built on the supervised contrastive formulation.
-
-    Each sample has exactly one positive pair: its paired augmentation in the other view.
-    """
-
-    def __init__(self, temperature: float = 0.07) -> None:
-        super().__init__()
-        self.loss = SupervisedContrastiveLoss(temperature=temperature)
-
-    def forward(self, z_i: torch.Tensor, z_j: torch.Tensor) -> torch.Tensor:
-        if z_i.shape != z_j.shape:
-            raise ValueError("z_i and z_j must have the same shape")
-        batch_size = z_i.size(0)
-        labels = torch.arange(batch_size, device=z_i.device, dtype=torch.long).repeat(2)
-        representations = torch.cat([z_i, z_j], dim=0)
-        return self.loss(representations, labels)
-
-
-class TripletLoss(nn.Module):
-    def __init__(self, margin: float = 1.0, p: float = 2.0) -> None:
-        super().__init__()
-        self.loss = nn.TripletMarginLoss(margin=margin, p=p)
-
-    def forward(
-        self,
-        anchor: torch.Tensor,
-        positive: torch.Tensor,
-        negative: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.loss(anchor, positive, negative)
 
 
 # =========================================================================================
@@ -337,11 +254,7 @@ class JointEmbeddingModule(nn.Module):
         embedding_dim: int = 128,
         projection_dim: int = 128,
         pretrained: bool = True,
-        expert_feature_source: FeatureSource = "embedding",
-        router_feature_source: FeatureSource = "embedding",
-        loss_type: LossType = "supcon",
         temperature: float = 0.07,
-        margin: float = 1.0,
     ) -> None:
         super().__init__()
 
@@ -351,19 +264,9 @@ class JointEmbeddingModule(nn.Module):
             embedding_dim=embedding_dim,
             projection_dim=projection_dim,
             pretrained=pretrained,
-            expert_feature_source=expert_feature_source,
-            router_feature_source=router_feature_source,
         )
 
-        self.loss_type = loss_type
-        if loss_type == "supcon":
-            self.contrastive_loss = SupervisedContrastiveLoss(temperature=temperature)
-        elif loss_type == "ntxent":
-            self.contrastive_loss = NTXentLoss(temperature=temperature)
-        elif loss_type == "triplet":
-            self.contrastive_loss = TripletLoss(margin=margin)
-        else:
-            raise ValueError(f"Unknown loss type: {loss_type}")
+        self.contrastive_loss = SupervisedContrastiveLoss(temperature=temperature)
 
     def forward(self, x: torch.Tensor, return_features: bool = True):
         return self.backbone(x, return_features=return_features)
@@ -374,20 +277,8 @@ class JointEmbeddingModule(nn.Module):
         labels: Optional[torch.Tensor] = None,
         embeddings: Optional[torch.Tensor] = None,
         projections: Optional[torch.Tensor] = None,
-        paired_projections: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-        triplet: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
-        if self.loss_type == "supcon":
-            feature_tensor = embeddings if embeddings is not None else projections
-            if feature_tensor is None or labels is None:
-                raise ValueError("supcon loss requires labels and embeddings or projections")
-            return self.contrastive_loss(feature_tensor, labels)
-
-        if self.loss_type == "ntxent":
-            if paired_projections is None:
-                raise ValueError("ntxent loss requires paired_projections=(z_i, z_j)")
-            return self.contrastive_loss(*paired_projections)
-
-        if triplet is None:
-            raise ValueError("triplet loss requires triplet=(anchor, positive, negative)")
-        return self.contrastive_loss(*triplet)
+        feature_tensor = embeddings if embeddings is not None else projections
+        if feature_tensor is None or labels is None:
+            raise ValueError("supcon loss requires labels and embeddings or projections")
+        return self.contrastive_loss(feature_tensor, labels)

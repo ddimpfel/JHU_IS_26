@@ -126,7 +126,7 @@ class GeneralistRouterExperts(nn.Module):
         return {
             'generalist': sum(p.numel() for p in self.generalist.parameters()),
             'router':     sum(p.numel() for p in self.router.parameters()),
-            'expert':     sum(p.numel() for p in self.experts[0].parameters()),
+            'expert':     sum(p.numel() for p in self.experts[0].parameters()) * self.num_experts,
         }
 
 # =========================================================================================    
