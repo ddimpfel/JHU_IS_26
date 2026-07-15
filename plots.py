@@ -109,6 +109,10 @@ def _short_plot_label(value):
     return f"{first}{initials}"
 
 
+def _strip_trailing_date_suffix(value):
+    return re.sub(r"_\d{4}-\d{2}-\d{2}$", "", str(value))
+
+
 def _resolve_short_label(row):
     if "Short Label" in row and pd.notna(row["Short Label"]):
         return row["Short Label"]
@@ -183,7 +187,7 @@ def load_serialized_training_run(file_path: str | Path):
 
     results["Eval Matrix"] = eval_mat
 
-    model_name = results.get("Model") or file_path.stem
+    model_name = results.get("Model") or _strip_trailing_date_suffix(file_path.stem)
     return {
         "model_name": model_name,
         "file_path": file_path,

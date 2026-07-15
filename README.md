@@ -107,6 +107,15 @@ This notebook is simply displaying the results gathered from `model_experiments.
 1. Load the json results files from `model_experimetns.ipynb` training runs into a `./results/` directory.
 2. Run all cells (packages required will be installed in the notebook if missing).
 
+### `backbone_experiments_comparison.ipynb`: serialized backbone results visualization
+
+This notebook compares the serialized experiment runs across backbone families while holding router and expert choices fixed for paired testing. It is intended to compare `MobileNet`, `ConvNeXt`, `JE MobileNet`, and `JE ConvNeXt` runs already saved to `./results/`.
+
+> Usage Instructions
+
+1. Load the serialized json results files into a `./results/` directory.
+2. Run all cells to generate summary tables, paired significance tests, and figures.
+
 ### Notes
 
 Despite literature, the layered router does show immediate positive improvement over the MLP router. The layered router has a much lower normalized entropy, which indicates it's more confident in assigning experts to given input images. It does come with a small but notable increase in total parameters, so the tradeoff depends on the use-case.
