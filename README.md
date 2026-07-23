@@ -130,7 +130,9 @@ There does appear to be a statistically significant different in F1 (p<<0.05) be
 
 The JE Convnext models do a significantly better job of separating similar classes in the latent space (bear in mind the latent space is 256 dimensions whereas the feature space is 768 dimensions). JE Convnext backbones have a `silhouette_score` > 0.65, representing strong in-class clustering and between-class separation. They also have the tightest Davies-Bouldin score, with JE MobileNext close behind, around 0.5 or less.
 
-- All autoencoder models have high trustworthiness (>0.985).
+- All autoencoder models have high trustworthiness (>0.984).
+
+JE appears to be improving how the router is leveraging the experts since the classes are more easily identifiable in the latent space. The projection vectors maybe easier to learn from for the MLP/Layered routers. The Transformer experts maybe performing better with JE projections since the projection vectors better represent a token vector.
 
 Expert collapse seen maybe caused simply by the dataset. The no passing classes are clearly separable and a single expert is often favored for always classifying that class, resulting in it's selection being boosted. How could this be avoided beyond auxilary loss?
 
