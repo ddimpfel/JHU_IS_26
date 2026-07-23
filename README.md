@@ -132,6 +132,8 @@ The JE Convnext models do a significantly better job of separating similar class
 
 - All autoencoder models have high trustworthiness (>0.985).
 
+Expert collapse seen maybe caused simply by the dataset. The no passing classes are clearly separable and a single expert is often favored for always classifying that class, resulting in it's selection being boosted. How could this be avoided beyond auxilary loss?
+
 ## Future Work
 
 Is loss from other GRE model components impacting the spread of the joint embedding backbone? The thought here is that larger loss values from submodels (i.e. transformer expert vs mlp expert) is resulting in a less separable latent space since their loss is a larger term.
@@ -144,4 +146,9 @@ Run ablation grid on JE hyperparameters to view how well different latent space 
 - Modify latent space dimensions.
 - Modify using embeddings or projections with varying latent space sizes.
 - Increase and decrease batch size to inspect effects on clustering/separation.
+- Increase and decrease auxilary loss hyperparameters to inspect their impact on variations between routers/expert selection ratios.
 - In a continual learning scenario, what effect does the exemplar sampling/ratio have on the clusters that are formed?
+
+Should there be pre-clustering analysis on the dataset to determine the optimal number of experts and top-k to use?
+
+- Some clusters are dominated by one expert, while others appear to share a few.
