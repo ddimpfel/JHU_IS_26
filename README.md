@@ -124,4 +124,24 @@ The various expert architectures give a small glimpse at how varying MoE submode
 
 - The transformer experts resulted in the lowest normalizd router entropy, so their use may have resulted in routers that are more confident in particular experts.
 
-There does not appear to be a statistically significant difference (p=0.05) between the router and expert configurations from the validation dataset metrics captured. Further investigation is required with the full test dataset prior to concluding if the simplest MLP router/experts are preferable.
+There does not appear to be a statistically significant difference (p>0.05) between the router and expert configurations from the validation dataset metrics captured. Further investigation is required with the full test dataset prior to concluding if the simplest MLP router/experts are preferable.
+
+There does appear to be a statistically significant different in F1 (p<<0.05) between the JE augmented Convnext backbone models and the standard GRE Convnext models for all configurations of submodels and backbones.
+
+The JE Convnext models do a significantly better job of separating similar classes in the latent space (bear in mind the latent space is 256 dimensions whereas the feature space is 768 dimensions). JE Convnext backbones have a `silhouette_score` > 0.65, representing strong in-class clustering and between-class separation. They also have the tightest Davies-Bouldin score, with JE MobileNext close behind, around 0.5 or less.
+
+- All autoencoder models have high trustworthiness (>0.985).
+
+## Future Work
+
+Is loss from other GRE model components impacting the spread of the joint embedding backbone? The thought here is that larger loss values from submodels (i.e. transformer expert vs mlp expert) is resulting in a less separable latent space since their loss is a larger term.
+
+- Would it be better to train the JE backbone separately at first, then integrate it with the MoE architecture?
+- Analyze the latent space in each training stage or at set points during model training (if not CIL) to view how the latent space forms over time.
+
+Run ablation grid on JE hyperparameters to view how well different latent space projections perform.
+
+- Modify latent space dimensions.
+- Modify using embeddings or projections with varying latent space sizes.
+- Increase and decrease batch size to inspect effects on clustering/separation.
+- In a continual learning scenario, what effect does the exemplar sampling/ratio have on the clusters that are formed?
