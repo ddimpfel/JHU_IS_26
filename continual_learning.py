@@ -297,14 +297,25 @@ class CILComputerVisionModel:
         torch.save(checkpoint, filename)
 
     @classmethod
-    def load(cls, model_instance: nn.Module, filename='cil_model_checkpoint.pth'):
-        checkpoint = torch.load(filename, weights_only=False)
+    def load(
+        cls,
+        model_instance: nn.Module,
+        filename='cil_model_checkpoint.pth',
+        map_location=None,
+        device=None,
+    ):
+        if map_location is None and device is not None:
+            map_location = device
+
+        checkpoint = torch.load(filename, weights_only=False, map_location=map_location)
+
+        target_device = device if device is not None else checkpoint['device']
 
         cil_object = cls(
             model=model_instance,
             exemplar_ratio=checkpoint['exemplar_ratio'],
             use_class_masking=checkpoint['use_class_masking'],
-            device=checkpoint['device']
+            device=target_device
         )
 
         cil_object.model.load_state_dict(checkpoint['model_state'])
