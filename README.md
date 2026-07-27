@@ -136,6 +136,8 @@ JE appears to be improving how the router is leveraging the experts since the cl
 
 Expert collapse seen maybe caused simply by the dataset. The no passing classes are clearly separable and a single expert is often favored for always classifying that class, resulting in it's selection being boosted. How could this be avoided beyond auxilary loss?
 
+Is the joint embedding projections turning the router into an angle analyzer? Essentially it's trying to learn which angle of latent space from the origin expert e is responsible for.
+
 ## Future Work
 
 Is loss from other GRE model components impacting the spread of the joint embedding backbone? The thought here is that larger loss values from submodels (i.e. transformer expert vs mlp expert) is resulting in a less separable latent space since their loss is a larger term.

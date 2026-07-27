@@ -7,6 +7,7 @@ from itertools import combinations
 from collections import defaultdict
 from tqdm import tqdm
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -823,6 +824,128 @@ def train_and_evaluate_cil_model(
 
     return results, loss_history_per_task, pred_cache
 
+def train_and_evaluate_control_models(
+    models_dict,
+    train_dataloader,
+    val_dataloader,
+    loss_fn,
+    optimizer_cls,
+    lr=0.001,
+    epochs=5,
+    device='cpu',
+    verbose=False,
+):
+    if isinstance(train_dataloader, (list, tuple)):
+        train_dataloader = build_complete_dataloader(list(train_dataloader), shuffle=True)
+    if isinstance(val_dataloader, (list, tuple)):
+        val_dataloader = build_complete_dataloader(list(val_dataloader), shuffle=False)
+
+    comparison_rows = []
+    trained_models = {}
+    loss_histories = {}
+    prediction_caches = {}
+
+    for name, get_model_fn in models_dict.items():
+        print(f"\n=== Fully training control model: {name} ===")
+        model = get_model_fn().to(device)
+        optimizer = optimizer_cls(model.parameters(), lr=lr)
+        loss_history = []
+
+        model.train()
+        start_time = time.time()
+        for epoch in range(epochs):
+            if verbose:
+                print(f"Epoch {epoch + 1}/{epochs}: {name}")
+            else:
+                print(f"\rTraining {name} - Epoch {epoch + 1}/{epochs}...", end="", flush=True)
+
+            for images, labels, _ in train_dataloader:
+                images = torch.stack(images).to(device)
+                y_true = torch.tensor(
+                    [label['label'] for label in labels],
+                    dtype=torch.long,
+                    device=device,
+                )
+
+                optimizer.zero_grad(set_to_none=True)
+                logits = model(images)
+                loss = loss_fn(logits, y_true)
+                loss.backward()
+                optimizer.step()
+
+                if hasattr(model, 'reset_routing_state'):
+                    model.reset_routing_state()
+
+                loss_history.append(loss.detach().item())
+
+        train_time = time.time() - start_time
+
+        model.eval()
+        total_loss = 0.0
+        all_logits = []
+        all_preds = []
+        all_targets = []
+        all_paths = []
+
+        with torch.no_grad():
+            print(f"\rEvaluating {name}...", end="", flush=True)
+            for images, labels, paths in val_dataloader:
+                images = torch.stack(images).to(device)
+                y_true = torch.tensor(
+                    [label['label'] for label in labels],
+                    dtype=torch.long,
+                    device=device,
+                )
+
+                logits = model(images)
+                loss_val = loss_fn(logits, y_true)
+                preds = torch.argmax(logits, dim=1)
+
+                total_loss += loss_val.item()
+                all_logits.append(logits.cpu().numpy())
+                all_preds.extend(preds.cpu().numpy())
+                all_targets.extend(y_true.cpu().numpy())
+                all_paths.extend(paths)
+
+        metrics = {
+            'Macro F1': f1_score(all_targets, all_preds, average='macro', zero_division=0),
+            'Micro F1': f1_score(all_targets, all_preds, average='micro', zero_division=0),
+            'Weighted F1': f1_score(all_targets, all_preds, average='weighted', zero_division=0),
+        }
+
+        results = {
+            'Model': name,
+            'Validation Loss': total_loss / len(val_dataloader),
+            'Validation Macro F1': metrics['Macro F1'],
+            'Validation Micro F1': metrics['Micro F1'],
+            'Validation Weighted F1': metrics['Weighted F1'],
+            'Training Time (s)': train_time,
+            'Num Parameters': sum(p.numel() for p in model.parameters()),
+            'Train Dataset Size': len(train_dataloader.dataset),
+            'Validation Dataset Size': len(val_dataloader.dataset),
+        }
+
+        print(
+            f"\rControl {name} Macro F1={metrics['Macro F1']:.4f} "
+            f"Micro F1={metrics['Micro F1']:.4f}"
+        )
+
+        comparison_rows.append(results)
+        trained_models[name] = model
+        loss_histories[name] = loss_history
+        prediction_caches[name] = {
+            'logits': np.concatenate(all_logits, axis=0) if all_logits else np.empty((0, 0)),
+            'targets': all_targets,
+            'paths': all_paths,
+            'metrics': metrics,
+        }
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    return pd.DataFrame(comparison_rows), trained_models, loss_histories, prediction_caches
+
 # =========================================================================================    
 # Results Serialization
 # =========================================================================================
@@ -857,12 +980,16 @@ def _to_json_compatible(value):
         return float(value)
     return value
 
+def serialize_save_json(data: dict, file: str):
+    with open(file, 'w') as f:
+        json.dump(_to_json_compatible(data), f, indent=4, cls=Encoder)
+
+
 def serialize_save_model_training(results: dict, pred_cache: dict, file: str):
-    eval_mat = results['Eval Matrix']
+    eval_mat = results.get('Eval Matrix')
     out = {
         'results': {k: v for k, v in results.items() if k != 'Eval Matrix'},
         'pred_cache': pred_cache,
         'eval_mat': eval_mat
     }
-    with open(file, 'w') as f:
-        json.dump(_to_json_compatible(out), f, indent=4, cls=Encoder)
+    serialize_save_json(out, file)
