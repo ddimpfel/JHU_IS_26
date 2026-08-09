@@ -93,7 +93,7 @@ def prepare_notebook_runtime(
         repo_root = Path("/content") / Path(repo_url).stem
         if not repo_root.exists():
             subprocess.run(["git", "clone", repo_url], check=True)
-        project_dir = repo_root / "Current Work"
+        project_dir = repo_root
         if not (project_dir / "init_experiment.py").exists():
             raise FileNotFoundError(f"Expected the experiment package at {project_dir}.")
         results_dir = Path(colab_drive_root) / results_namespace
