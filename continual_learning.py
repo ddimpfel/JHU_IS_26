@@ -2,7 +2,9 @@ import gc
 import copy
 import json
 import time
-from typing import Callable, Literal, overload
+from dataclasses import dataclass
+from time import perf_counter
+from typing import Any, Callable, Literal, overload
 from itertools import combinations
 from collections import defaultdict
 from tqdm import tqdm
@@ -20,6 +22,44 @@ from statsmodels.stats.multitest import multipletests
 # =========================================================================================    
 # Class-Incremental Implementation
 # =========================================================================================
+
+
+@dataclass
+class TrainingThroughput:
+    """Optimizer-only work performed while training one or more CIL tasks."""
+
+    total_samples: int = 0
+    total_optimizer_steps: int = 0
+    timed_samples: int = 0
+    timed_optimizer_steps: int = 0
+    optimization_seconds: float = 0.0
+
+    def record(self, batch_size: int, elapsed_seconds: float | None) -> None:
+        self.total_samples += batch_size
+        self.total_optimizer_steps += 1
+        if elapsed_seconds is not None:
+            self.timed_samples += batch_size
+            self.timed_optimizer_steps += 1
+            self.optimization_seconds += elapsed_seconds
+
+    def to_dict(self) -> dict[str, float | int]:
+        return {
+            "Training Samples": self.total_samples,
+            "Training Optimizer Steps": self.total_optimizer_steps,
+            "Timed Training Samples": self.timed_samples,
+            "Timed Optimizer Steps": self.timed_optimizer_steps,
+            "Measured Optimization Time (s)": self.optimization_seconds,
+            "Training Throughput (samples/s)": (
+                self.timed_samples / self.optimization_seconds
+                if self.optimization_seconds > 0
+                else float("nan")
+            ),
+        }
+
+
+def _synchronize_if_cuda(device: str) -> None:
+    if str(device).startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize()
 
 class CILComputerVisionModel:
     """
@@ -111,6 +151,7 @@ class CILComputerVisionModel:
             num_workers=getattr(train_dataloader, "num_workers", 0),
             pin_memory=getattr(train_dataloader, "pin_memory", False),
             persistent_workers=getattr(train_dataloader, "persistent_workers", False),
+            generator=getattr(train_dataloader, "generator", None),
         )
 
     def get_exemplar_count(self):
@@ -138,7 +179,17 @@ class CILComputerVisionModel:
 
         return (1 - self.lambda_kd) * loss_pred + self.lambda_kd * loss_kd + aux_loss
 
-    def train(self, train_dataloader: DataLoader, optimizer: Optimizer, loss_fn, epochs: int, verbose: bool):
+    def train(
+        self,
+        train_dataloader: DataLoader,
+        optimizer: Optimizer,
+        loss_fn,
+        epochs: int,
+        verbose: bool,
+        *,
+        throughput_warmup_batches: int = 0,
+        return_measurement: bool = False,
+    ):
         self.model.train()
         loss_history = []
 
@@ -153,6 +204,8 @@ class CILComputerVisionModel:
         if verbose:
             print(f"\rTask dataloarder ready: {len(task_dataloader.dataset)} images in task.")
 
+        measurement = TrainingThroughput()
+        batch_number = 0
         for epoch in range(epochs):
             progress_bar = task_dataloader
             if verbose:
@@ -166,10 +219,23 @@ class CILComputerVisionModel:
                     device=self.device,
                 )
 
+                measure_batch = batch_number >= throughput_warmup_batches
+                start_time = 0.0
+                if return_measurement and measure_batch:
+                    _synchronize_if_cuda(self.device)
+                    start_time = perf_counter()
+
                 optimizer.zero_grad(set_to_none=True)
                 loss_val = self.loss(loss_fn, images, y_true)
                 loss_val.backward()
                 optimizer.step()
+
+                elapsed_seconds = None
+                if return_measurement and measure_batch:
+                    _synchronize_if_cuda(self.device)
+                    elapsed_seconds = perf_counter() - start_time
+                measurement.record(batch_size=len(y_true), elapsed_seconds=elapsed_seconds)
+                batch_number += 1
 
                 if hasattr(self.model, "reset_routing_state"):
                     # Reset GRE state
@@ -210,6 +276,8 @@ class CILComputerVisionModel:
         for param in self.prev_model.parameters():
             param.requires_grad = False
 
+        if return_measurement:
+            return loss_history, measurement
         return loss_history
 
     @overload
@@ -241,10 +309,10 @@ class CILComputerVisionModel:
     ):
         self.model.eval()
         total_loss = 0.0
-        all_logits = []
         all_preds = []
         all_targets = []
-        all_paths = []
+        all_logits = [] if return_logits else None
+        all_paths = [] if return_logits else None
 
         with torch.no_grad():
             for images, labels, paths in test_dataloader:
@@ -266,10 +334,12 @@ class CILComputerVisionModel:
                 total_loss += loss_val.item()
 
                 y_preds = torch.argmax(eval_logits, dim=1)
-                all_logits.append(y_pred_logits.cpu().numpy())
                 all_preds.extend(y_preds.cpu().numpy())
                 all_targets.extend(y_true.cpu().numpy())
-                all_paths.extend(paths)
+                if return_logits:
+                    assert all_logits is not None and all_paths is not None
+                    all_logits.append(y_pred_logits.cpu().numpy())
+                    all_paths.extend(paths)
 
         metrics = {
             "Macro F1": f1_score(all_targets, all_preds, average="macro", zero_division=0),
@@ -277,6 +347,7 @@ class CILComputerVisionModel:
             "Weighted F1": f1_score(all_targets, all_preds, average="weighted", zero_division=0),
         }
         if return_logits:
+            assert all_logits is not None and all_paths is not None
             all_logits = np.concatenate(all_logits, axis=0)
             return total_loss / len(test_dataloader), metrics, all_logits, all_targets, all_paths
         return total_loss / len(test_dataloader), metrics
@@ -682,7 +753,8 @@ def create_task_dataloaders(
 def train_and_evaluate_cil_model(
     cil_model: CILComputerVisionModel, optimizer_cls, loss_fn, 
     train_dataloaders: list[DataLoader], val_dataloaders: list[DataLoader],
-    epochs=5, num_tasks=5, base_lr=0.001, device='cpu', verbose=False
+    epochs=5, num_tasks=5, base_lr=0.001, later_task_lr_factor=0.1,
+    device='cpu', verbose=False, throughput_warmup_batches=0,
 ):
     score_names = ("Macro F1", "Micro F1", "Weighted F1")
     model = cil_model.model.to(device)
@@ -699,10 +771,9 @@ def train_and_evaluate_cil_model(
         score_name: np.zeros(num_tasks)
         for score_name in score_names
     }
-    task_training_times = []
+    task_throughput = []
     model_name = model.__class__.__name__ if hasattr(model, '__class__') else 'Unknown'
     loss_history_per_task = []
-    pred_cache = {}
 
     full_val_dataloader = build_complete_dataloader(val_dataloaders, shuffle=False)
 
@@ -738,41 +809,41 @@ def train_and_evaluate_cil_model(
             for score_name in score_names:
                 forward_eval_matrices[score_name][i, i - 1] = pre_task_metrics[score_name]
 
-        current_lr = base_lr if i == 0 else base_lr * 0.1 # use learning rate scheduler or make this a hyperparameter?
+        current_lr = base_lr if i == 0 else base_lr * later_task_lr_factor
         optimizer = optimizer_cls(cil_model.model.parameters(), lr=current_lr)
 
-        # train
-        start_time = time.time()
-        task_lost_history = cil_model.train(
+        # Train. Throughput intentionally excludes data loading, validation, and I/O.
+        task_lost_history, task_measurement = cil_model.train(
             train_dataloaders[i], optimizer, loss_fn,
-            epochs, verbose=verbose
+            epochs,
+            verbose=verbose,
+            throughput_warmup_batches=throughput_warmup_batches,
+            return_measurement=True,
         )
-        compute_time = time.time() - start_time
 
-        task_training_times.append(compute_time)
+        task_throughput.append(task_measurement)
         loss_history_per_task.append(task_lost_history)
 
         # eval each task
         for t in range(i + 1):
-            _, val_metrics, task_logits, task_targets, task_paths = cil_model.evaluate(
+            _, val_metrics = cil_model.evaluate(
                 val_dataloaders[t],
                 loss_fn,
-                return_logits=True,
             )
             for score_name in score_names:
                 eval_matrices[score_name][t, i] = val_metrics[score_name]
-            pred_cache[(i, t)] = {
-                "logits": task_logits,
-                "targets": task_targets,
-                "paths": task_paths,
-                "metrics": val_metrics,
-            }
             if i == 0:
                 baseline_accuracy = val_metrics["Macro F1"]
             if verbose: print(f"    Task {t+1}: Macro F1 = {val_metrics['Macro F1']:.4f}")
         if verbose: print(f"    Exemplar set size = {cil_model.get_exemplar_count()}")
 
-    print(f"\nTotal compute time = {np.sum(task_training_times):.2f}s")
+    aggregate_throughput = TrainingThroughput()
+    for measurement in task_throughput:
+        aggregate_throughput.total_samples += measurement.total_samples
+        aggregate_throughput.total_optimizer_steps += measurement.total_optimizer_steps
+        aggregate_throughput.timed_samples += measurement.timed_samples
+        aggregate_throughput.timed_optimizer_steps += measurement.timed_optimizer_steps
+        aggregate_throughput.optimization_seconds += measurement.optimization_seconds
 
     macro_results = summarize_continual_metric_results(
         eval_matrix=eval_matrices["Macro F1"],
@@ -811,8 +882,13 @@ def train_and_evaluate_cil_model(
         'Full Validation Macro F1': full_val_metrics['Macro F1'],
         'Full Validation Micro F1': full_val_metrics['Micro F1'],
         'Full Validation Weighted F1': full_val_metrics['Weighted F1'],
-        'Training Time per Stage': task_training_times,
-        'Total Compute Time (s)': np.sum(task_training_times),
+        'Training Throughput per Stage (samples/s)': [
+            measurement.to_dict()['Training Throughput (samples/s)']
+            for measurement in task_throughput
+        ],
+        'Training Samples per Stage': [measurement.total_samples for measurement in task_throughput],
+        'Timed Training Samples per Stage': [measurement.timed_samples for measurement in task_throughput],
+        **aggregate_throughput.to_dict(),
         'Num Parameters': sum(p.numel() for p in model.parameters()),
         'Eval Matrix': macro_results['Eval Matrix']
     }
@@ -822,7 +898,62 @@ def train_and_evaluate_cil_model(
         torch.cuda.empty_cache()
     gc.collect()
 
-    return results, loss_history_per_task, pred_cache
+    return results, loss_history_per_task
+
+
+def train_final_cil_model(
+    cil_model: CILComputerVisionModel,
+    optimizer_cls,
+    loss_fn,
+    train_dataloaders: list[DataLoader],
+    epochs: int = 5,
+    base_lr: float = 0.001,
+    later_task_lr_factor: float = 0.1,
+    verbose: bool = False,
+    throughput_warmup_batches: int = 0,
+) -> tuple[dict[str, Any], list[list[float]]]:
+    """Train a final CIL replica on all source training data without validation."""
+    task_throughput: list[TrainingThroughput] = []
+    loss_history_per_task: list[list[float]] = []
+
+    for task_index, train_dataloader in enumerate(train_dataloaders):
+        current_lr = base_lr if task_index == 0 else base_lr * later_task_lr_factor
+        optimizer = optimizer_cls(cil_model.model.parameters(), lr=current_lr)
+        task_loss_history, task_measurement = cil_model.train(
+            train_dataloader,
+            optimizer,
+            loss_fn,
+            epochs,
+            verbose=verbose,
+            throughput_warmup_batches=throughput_warmup_batches,
+            return_measurement=True,
+        )
+        task_throughput.append(task_measurement)
+        loss_history_per_task.append(task_loss_history)
+
+    aggregate_throughput = TrainingThroughput()
+    for measurement in task_throughput:
+        aggregate_throughput.total_samples += measurement.total_samples
+        aggregate_throughput.total_optimizer_steps += measurement.total_optimizer_steps
+        aggregate_throughput.timed_samples += measurement.timed_samples
+        aggregate_throughput.timed_optimizer_steps += measurement.timed_optimizer_steps
+        aggregate_throughput.optimization_seconds += measurement.optimization_seconds
+
+    results: dict[str, Any] = {
+        'Training Throughput per Stage (samples/s)': [
+            measurement.to_dict()['Training Throughput (samples/s)']
+            for measurement in task_throughput
+        ],
+        'Training Samples per Stage': [measurement.total_samples for measurement in task_throughput],
+        'Timed Training Samples per Stage': [measurement.timed_samples for measurement in task_throughput],
+        **aggregate_throughput.to_dict(),
+        'Final Exemplar Count': cil_model.get_exemplar_count(),
+        'Num Parameters': sum(parameter.numel() for parameter in cil_model.model.parameters()),
+    }
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
+    return results, loss_history_per_task
 
 def train_and_evaluate_control_models(
     models_dict,
@@ -985,11 +1116,11 @@ def serialize_save_json(data: dict, file: str):
         json.dump(_to_json_compatible(data), f, indent=4, cls=Encoder)
 
 
-def serialize_save_model_training(results: dict, pred_cache: dict, file: str):
+def serialize_save_model_training(results: dict, file: str):
+    """Persist aggregate training/validation results without per-example predictions."""
     eval_mat = results.get('Eval Matrix')
     out = {
         'results': {k: v for k, v in results.items() if k != 'Eval Matrix'},
-        'pred_cache': pred_cache,
         'eval_mat': eval_mat
     }
     serialize_save_json(out, file)

@@ -27,8 +27,8 @@ class JointEmbeddingBackboneTests(unittest.TestCase):
         encoded = model.encode(self.images)
 
         self.assertEqual(logits.shape, (2, 4))
-        self.assertEqual(features.shape, (2, 32))
-        self.assertTrue(torch.allclose(features, encoded["embeddings"]))
+        self.assertEqual(features.shape, (2, 16))
+        self.assertTrue(torch.allclose(features, encoded["projections"]))
 
     def test_forward_returns_only_logits_when_requested(self) -> None:
         model = JointEmbeddingBackbone(
@@ -47,9 +47,9 @@ class JointEmbeddingBackboneTests(unittest.TestCase):
         logits, features = model(self.images, return_features=True)
         encoded = model.encode(self.images)
 
-        self.assertEqual(logits.shape, (2, 5))
-        self.assertEqual(features.shape[1], model.backbone_feature_dim)
-        self.assertTrue(torch.allclose(features, encoded["backbone_features"]))
+        self.assertEqual(logits.shape, (2, 3))
+        self.assertEqual(features.shape[1], 12)
+        self.assertTrue(torch.allclose(features, encoded["projections"]))
 
 
 class ContrastiveLossTests(unittest.TestCase):
@@ -91,7 +91,7 @@ class JointEmbeddingModuleTests(unittest.TestCase):
         logits, features = module(self.images, return_features=True)
 
         self.assertEqual(logits.shape, (2, 4))
-        self.assertEqual(features.shape, (2, 32))
+        self.assertEqual(features.shape, (2, 16))
 
     def test_module_supcon_dispatch_accepts_embeddings(self) -> None:
         module = JointEmbeddingModule(

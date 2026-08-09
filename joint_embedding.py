@@ -55,7 +55,7 @@ class JointEmbeddingBackbone(nn.Module):
     def __init__(
         self,
         num_classes: int,
-        backbone: BackboneName = "mobilenet_v3_small",
+        backbone: BackboneName = "mobilenet_v3_large",
         embedding_dim: int = 128,
         projection_dim: int = 128,
         pretrained: bool = True,
@@ -250,7 +250,7 @@ class JointEmbeddingModule(nn.Module):
     def __init__(
         self,
         num_classes: int,
-        backbone: BackboneName = "mobilenet_v3_small",
+        backbone: BackboneName = "mobilenet_v3_large",
         embedding_dim: int = 128,
         projection_dim: int = 128,
         pretrained: bool = True,

@@ -10,9 +10,19 @@ A secondary goal is evaluating the introduction of a joint embedding backbone as
 
 Specifically, the study hypothesizes:
 
-1. Layered routers are more resilient to expert collapse and more reliable for routing tasks than MLP routers.
+1. The deeper MLP router is more resilient to expert collapse and more reliable for routing tasks than the single-layer regression router.
 2. Joint embedding models learn a separable latent space between GTSRB classes and across tasks, creating reliable embedding vectors.
 3. MoE models leveraging a joint embedding backbone have enhanced prediction performance and reliability when compared to a traditional CNN backbone MoE.
+
+## Registered experiment protocol
+
+The active experiment notebooks are under `notebooks/`. They use `init_experiment.py` as the single source of truth for data, model definitions, CIL behavior, serialization, and recovery.
+
+- **CIL cross-validation:** selected `train.csv` records are retained as the training source. Each of the three CIL tasks is independently divided into three stratified folds. For fold $f$, every task trains on its other two task-local folds and validates on its own fold $f$. Thus CIL replay, distillation, class masking, and JE contrastive loss are present in every CV unit. The held-out `test.csv` partition is never used for selection.
+- **Final replicas:** after selecting the protocol from CV results, each condition trains CIL task-by-task on all selected `train.csv` records. The default final seeds are `(7, 17, 27)`; only this final stage writes checkpoints for test evaluation.
+- **Training cost:** the headline compute metric is training throughput, $\text{timed samples} / \text{measured optimization seconds}$. Timing covers only forward pass, loss, backward pass, and optimizer step. The first three batches of each CIL task are trained but excluded, and CUDA is synchronized around every measured batch. `cost_proxy` remains a parameter-based companion metric.
+- **Recovery:** choose a stable `RUN_NAME` and set `RESUME = True`. Each CV `(spec, repeat, fold)` and final `(spec, seed)` unit writes an immutable result and is skipped only when its durable progress entry and artifact(s) are complete. Interrupted units restart from task one; exemplar state is not resumed mid-unit.
+- **Inference:** CV comparisons pair matching fold identities. Final test comparisons pair matching final seeds. Three final seeds provide replica-aware descriptive estimates but do not, by themselves, establish per-condition statistical significance. Example-level bootstrap is supplemental and conditional on the trained models.
 
 ## Files
 
@@ -34,7 +44,7 @@ Utilities in the file include:
   - Sets up evaluation matrix, metrics, and datasets for training/evaluation.
   - Iterates over pseudo-time training tasks.
   - Decreases learning rate dynamically after task 1 by maintaining a reduced lr \* 0.1.
-  - Gathers all results, loss histories, and predictions for later visualization and/or further statistical testing.
+  - Aggregates results and loss histories for later visualization and/or further statistical testing.
 
 ### `gre_model_base.py`: the core mixture of experts model setup
 
@@ -86,8 +96,8 @@ The use of the exemplar set from the continual learning setup may allow the JE b
 
 This notebook is used as the pipeline for training the various non-JE augmented MoE models and displaying their immediate, back of the napkin results. The models evaluated using this notebook are combinations of:
 
-- Generalists: `MobileNet` and `ConvNext`.
-- Router types: Single layer MLP router (`MlpRouter`) and a deeper `LayeredRouter`.
+- Generalists: `MobileNetV3 Large` and `ConvNeXt Tiny`.
+- Router types: a single-layer regression router (`RegressionRouter`) and a deeper MLP router (`MlpRouter`).
 - Experts: `MlpExpert`, `TransformerExpert`, and `ResidualGatedMlpExpert`.
 
 > Usage Instructions
@@ -109,7 +119,7 @@ This notebook is simply displaying the results gathered from `model_experiments.
 
 ### `backbone_experiments_comparison.ipynb`: serialized backbone results visualization
 
-This notebook compares the serialized experiment runs across backbone families while holding router and expert choices fixed for paired testing. It is intended to compare `MobileNet`, `ConvNeXt`, `JE MobileNet`, and `JE ConvNeXt` runs already saved to `./results/`.
+This notebook compares the serialized experiment runs across backbone families while holding router and expert choices fixed for paired testing. It is intended to compare `MobileNetV3 Large`, `ConvNeXt Tiny`, `JE MobileNetV3 Large`, and `JE ConvNeXt Tiny` runs already saved to `./results/`.
 
 > Usage Instructions
 
@@ -118,13 +128,13 @@ This notebook compares the serialized experiment runs across backbone families w
 
 ### Notes
 
-Despite literature, the layered router does show immediate positive improvement over the MLP router. The layered router has a much lower normalized entropy, which indicates it's more confident in assigning experts to given input images. It does come with a small but notable increase in total parameters, so the tradeoff depends on the use-case.
+Despite literature, the deeper MLP router does show immediate positive improvement over the single-layer regression router. The deeper MLP router has a much lower normalized entropy, which indicates it's more confident in assigning experts to given input images. It does come with a small but notable increase in total parameters, so the tradeoff depends on the use-case.
 
 The various expert architectures give a small glimpse at how varying MoE submodels can impact results. The residual gated MLP experts appear to be significantly worse at predicting on the base CNN backbone features than the standard MLP experts. The transformer experts appear to perform slightly worse at generalizing in post training, but they do perform slightly better at forward transfer.
 
 - The transformer experts resulted in the lowest normalizd router entropy, so their use may have resulted in routers that are more confident in particular experts.
 
-There does not appear to be a statistically significant difference (p>0.05) between the router and expert configurations from the validation dataset metrics captured. Further investigation is required with the full test dataset prior to concluding if the simplest MLP router/experts are preferable.
+There does not appear to be a statistically significant difference (p>0.05) between the router and expert configurations from the validation dataset metrics captured. Further investigation is required with the full test dataset prior to concluding if the simplest regression router/experts are preferable.
 
 There does appear to be a statistically significant different in F1 (p<<0.05) between the JE augmented Convnext backbone models and the standard GRE Convnext models for all configurations of submodels and backbones.
 
@@ -132,7 +142,7 @@ The JE Convnext models do a significantly better job of separating similar class
 
 - All autoencoder models have high trustworthiness (>0.984).
 
-JE appears to be improving how the router is leveraging the experts since the classes are more easily identifiable in the latent space. The projection vectors maybe easier to learn from for the MLP/Layered routers. The Transformer experts maybe performing better with JE projections since the projection vectors better represent a token vector.
+JE appears to be improving how the router is leveraging the experts since the classes are more easily identifiable in the latent space. The projection vectors may be easier to learn from for the regression and MLP routers. The Transformer experts may be performing better with JE projections since the projection vectors better represent a token vector.
 
 Expert collapse seen maybe caused simply by the dataset. The no passing classes are clearly separable and a single expert is often favored for always classifying that class, resulting in it's selection being boosted. How could this be avoided beyond auxilary loss?
 
