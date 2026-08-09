@@ -138,7 +138,7 @@ class ExperimentConfig:
     class_ids: tuple[int, ...] = DEFAULT_GTSRB_CLASSES
     validation_fraction: float = 0.20
     image_size: int = 224
-    batch_size: int = 64
+    batch_size: int = 256
     num_workers: int = 0
     pin_memory: bool | None = None
     persistent_workers: bool | None = None

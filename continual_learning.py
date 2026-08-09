@@ -342,8 +342,8 @@ class CILComputerVisionModel:
                     all_paths.extend(paths)
 
         metrics = {
-            "Macro F1": f1_score(all_targets, all_preds, average="macro", zero_division=0),
             "Micro F1": f1_score(all_targets, all_preds, average="micro", zero_division=0),
+            "Macro F1": f1_score(all_targets, all_preds, average="macro", zero_division=0),
             "Weighted F1": f1_score(all_targets, all_preds, average="weighted", zero_division=0),
         }
         if return_logits:
@@ -395,6 +395,7 @@ class CILComputerVisionModel:
         if checkpoint['prev_model_state'] is not None:
             cil_object.prev_model = copy.deepcopy(model_instance).to(cil_object.device)
             cil_object.prev_model.load_state_dict(checkpoint['prev_model_state'])
+            cil_object.prev_model.requires_grad_(False)
 
         cil_object.seen_classes         = checkpoint['seen_classes']
         cil_object.seen_classes_tensor  = checkpoint['seen_classes_tensor']
@@ -539,15 +540,15 @@ def bootstrap_learning(preds, num_tasks, rng, resamples=1000):
         return {}
 
     return {
-        "AvgAcc": [np.mean(avg_acc_samples)],
-        "AvgAcc 95% CI Low": [np.percentile(avg_acc_samples, 2.5)],
-        "AvgAcc 95% CI High": [np.percentile(avg_acc_samples, 97.5)],
+        "AvgAcc Macro F1": [np.mean(avg_acc_samples)],
+        "AAMF1 95% CI Low": [np.percentile(avg_acc_samples, 2.5)],
+        "AAMF1 95% CI High": [np.percentile(avg_acc_samples, 97.5)],
         "Fbar": [np.mean(avg_f_samples)],
         "Fbar 95% CI Low": [np.percentile(avg_f_samples, 2.5)],
         "Fbar 95% CI High": [np.percentile(avg_f_samples, 97.5)]
     }
     
-def bootstrap_learning_diff(model_logits: dict, num_tasks, resamples=1000):
+def bootstrap_learning_diff(model_logits: dict, num_tasks, rng, resamples=1000):
     avg_acc_delta_samples = []
     avg_f_delta_samples = []
     
@@ -563,7 +564,7 @@ def bootstrap_learning_diff(model_logits: dict, num_tasks, resamples=1000):
             # Sample for task
             y_true_ref = np.array(model_a_dict[(t, t)][1])
             n_samples = len(y_true_ref)
-            indices = np.random.choice(n_samples, n_samples, replace=True)
+            indices = rng.choice(n_samples, n_samples, replace=True)
 
             for i in range(t, num_tasks):
                 pred_A = np.argmax(np.array(model_a_dict[(i, t)][0]), axis=1)
@@ -617,84 +618,262 @@ def bootstrap_learning_diff(model_logits: dict, num_tasks, resamples=1000):
         "Fbar FDR BH P Value": bh_f_p_value[0]
     }
     
-def bootstrap_performance_diff(test_dataloader, models_dict, device, resamples=1000):
+def bootstrap_performance_diff(
+    test_dataloader,
+    models_dict,
+    device,
+    rng,
+    resamples=10_000,
+    average="macro",
+    stratified=True,
+):
     """
-    Calculates 95% Bayesian confidence interval and p-values of the final model accuracy.
+    Paired nonparametric bootstrap comparison of trained models on one
+    held-out test set.
 
-    Predict on the entire test set with all models to get sampling distribution for
-    evaluation. Then calculate AvgAcc from a bootstrap sampling of the predictions
-    to compare each model's difference in predictive capability.
+    The same resampled test examples are used for every model in each
+    bootstrap replicate, preserving the paired prediction structure.
     """
-    # Predict on test data
+    if resamples < 2:
+        raise ValueError("resamples must be >= 2.")
+
+    if len(models_dict) < 2:
+        raise ValueError("At least two models are required.")
+
+    if average not in {"macro", "micro", "weighted"}:
+        raise ValueError(
+            "average must be one of {'macro', 'micro', 'weighted'}."
+        )
+
+    # ---------------------------------------------------------------
+    # 1. Run every model over exactly the same held-out examples.
+    # ---------------------------------------------------------------
+
     all_targets = []
-    model_preds = defaultdict(list)
-    for images, labels, _ in test_dataloader:
-        images = torch.stack(images).to(device)
-        y_true = torch.tensor([l['label'] for l in labels], dtype=torch.long)
-        all_targets.extend(y_true.numpy())
+    model_preds = {
+        name: []
+        for name in models_dict
+    }
 
-        for name, model in models_dict.items():
-            model.eval()
-            with torch.no_grad():
-                y_pred = torch.argmax(model(images), dim=1)
-                model_preds[name].extend(y_pred.cpu().numpy())
+    for model in models_dict.values():
+        model.eval()
+
+    with torch.no_grad():
+        for images, labels, _ in test_dataloader:
+            images = torch.stack(images).to(device)
+
+            y_true = np.asarray(
+                [label["label"] for label in labels],
+                dtype=np.int64,
+            )
+
+            all_targets.extend(y_true.tolist())
+
+            for name, model in models_dict.items():
+                logits = model(images)
+                predictions = torch.argmax(logits, dim=1)
+
+                model_preds[name].extend(
+                    predictions.cpu().numpy().tolist()
+                )
+
+                if hasattr(model, "reset_routing_state"):
+                    model.reset_routing_state()
+
+    all_targets = np.asarray(all_targets, dtype=np.int64)
+
+    model_preds = {
+        name: np.asarray(predictions, dtype=np.int64)
+        for name, predictions in model_preds.items()
+    }
 
     n_samples = len(all_targets)
-    all_targets = np.array(all_targets)
-    for name in model_preds:
-        model_preds[name] = np.array(model_preds[name])
 
+    if n_samples == 0:
+        raise ValueError("The test dataloader produced no samples.")
 
-    # Bootstrap sample model predictions
-    bootstrap_results = []
-    resampled_f1s = {name: [] for name in models_dict.keys()}
-    for b in range(resamples):
-        indices = np.random.choice(n_samples, size=n_samples, replace=True)
+    for name, predictions in model_preds.items():
+        if len(predictions) != n_samples:
+            raise RuntimeError(
+                f"{name!r} produced {len(predictions)} predictions "
+                f"for {n_samples} targets."
+            )
+
+    # ---------------------------------------------------------------
+    # 2. Observed test-set F1.
+    # ---------------------------------------------------------------
+
+    observed_f1 = {
+        name: f1_score(
+            all_targets,
+            predictions,
+            average=average,
+            zero_division=0,
+        )
+        for name, predictions in model_preds.items()
+    }
+
+    # ---------------------------------------------------------------
+    # 3. Prepare stratified bootstrap index groups.
+    # ---------------------------------------------------------------
+
+    if stratified:
+        class_indices = [
+            np.flatnonzero(all_targets == class_id)
+            for class_id in np.unique(all_targets)
+        ]
+
+    bootstrap_f1 = {
+        name: np.empty(resamples, dtype=np.float64)
+        for name in models_dict
+    }
+
+    # ---------------------------------------------------------------
+    # 4. Paired bootstrap.
+    #
+    # Critically: one `indices` vector is generated per replicate and
+    # reused for every model.
+    # ---------------------------------------------------------------
+
+    for bootstrap_index in range(resamples):
+
+        if stratified:
+            indices = np.concatenate([
+                rng.choice(
+                    indices_for_class,
+                    size=len(indices_for_class),
+                    replace=True,
+                )
+                for indices_for_class in class_indices
+            ])
+
+            # Ordering is irrelevant to F1, but shuffling avoids leaving
+            # every bootstrap replicate class-block ordered.
+            rng.shuffle(indices)
+
+        else:
+            indices = rng.choice(
+                n_samples,
+                size=n_samples,
+                replace=True,
+            )
+
         y_true_b = all_targets[indices]
 
-        for name in models_dict.keys():
-            y_pred_b = model_preds[name][indices]
-            f1_b = f1_score(y_true_b, y_pred_b, average='macro', zero_division=0)
-            resampled_f1s[name].append(f1_b)
+        for name, predictions in model_preds.items():
+            y_pred_b = predictions[indices]
 
+            bootstrap_f1[name][bootstrap_index] = f1_score(
+                y_true_b,
+                y_pred_b,
+                average=average,
+                zero_division=0,
+            )
 
-    # Calculate stats per pairwise comparison
-    p_values_list = []
-    for (name_A, name_B) in list(combinations(models_dict.keys(), 2)):
-        f1_A = np.array(resampled_f1s[name_A])
-        f1_B = np.array(resampled_f1s[name_B])
+    # ---------------------------------------------------------------
+    # 5. Per-model bootstrap summaries.
+    # ---------------------------------------------------------------
 
-        delta = f1_A - f1_B
-        ci_lower, ci_upper = np.percentile(delta, [2.5, 97.5])
-        p_value = 2 * min((delta <= 0).mean(), (delta >= 0).mean())
-
-        bootstrap_results.append({
-            'Model A': name_A,
-            'Model B': name_B,
-            'Mean Delta (F1_A - F1_B)': np.mean(delta),
-            '95% CI Lower': ci_lower,
-            '95% CI Upper': ci_upper,
-            'p_value': p_value
-        })
-        p_values_list.append(p_value)
-
-
-    # Correct p-values for multiple comparisons
-    _, bh_p_values, _, _ = multipletests(p_values_list, method='fdr_bh')
-    for i, res in enumerate(bootstrap_results):
-        res['BH_p_value'] = bh_p_values[i]
-
-    # Get final models results
     model_performance = []
-    for name in models_dict.keys():
-        f1 = np.array(resampled_f1s[name])
+
+    for name, samples in bootstrap_f1.items():
+        ci_low, ci_high = np.percentile(
+            samples,
+            [2.5, 97.5],
+        )
+
         model_performance.append({
-            'Model': name,
-            'Mean F1': np.mean(f1),
-            'Std F1': np.std(f1)
+            "Model": name,
+            "Observed F1": observed_f1[name],
+            "Bootstrap Mean F1": samples.mean(),
+            "Bootstrap Std F1": samples.std(ddof=1),
+            "95% CI Lower": ci_low,
+            "95% CI Upper": ci_high,
+            "F1 Average": average,
+            "Bootstrap Resamples": resamples,
         })
 
-    return bootstrap_results, model_performance
+    # ---------------------------------------------------------------
+    # 6. Paired model differences.
+    # ---------------------------------------------------------------
+
+    pairwise_results = []
+
+    for name_a, name_b in combinations(models_dict.keys(), 2):
+
+        bootstrap_delta = (
+            bootstrap_f1[name_a]
+            - bootstrap_f1[name_b]
+        )
+
+        observed_delta = (
+            observed_f1[name_a]
+            - observed_f1[name_b]
+        )
+
+        ci_low, ci_high = np.percentile(
+            bootstrap_delta,
+            [2.5, 97.5],
+        )
+
+        # Supplemental bootstrap sign/tail probability.
+        #
+        # +1 correction prevents a reported value of exactly zero when
+        # the number of bootstrap draws is finite.
+        lower_tail = (
+            np.count_nonzero(bootstrap_delta <= 0) + 1
+        ) / (resamples + 1)
+
+        upper_tail = (
+            np.count_nonzero(bootstrap_delta >= 0) + 1
+        ) / (resamples + 1)
+
+        bootstrap_tail_probability = min(
+            1.0,
+            2.0 * min(lower_tail, upper_tail),
+        )
+
+        pairwise_results.append({
+            "Model A": name_a,
+            "Model B": name_b,
+            "Observed Delta (A-B)": observed_delta,
+            "Bootstrap Mean Delta": bootstrap_delta.mean(),
+            "95% CI Lower": ci_low,
+            "95% CI Upper": ci_high,
+            "Bootstrap Tail Probability": bootstrap_tail_probability,
+            "F1 Average": average,
+            "Bootstrap Resamples": resamples,
+        })
+
+    # ---------------------------------------------------------------
+    # 7. FDR correction over the COMPLETE pairwise family.
+    # ---------------------------------------------------------------
+
+    raw_tail_probabilities = np.asarray([
+        row["Bootstrap Tail Probability"]
+        for row in pairwise_results
+    ])
+
+    _, adjusted, _, _ = multipletests(
+        raw_tail_probabilities,
+        alpha=0.05,
+        method="fdr_bh",
+    )
+
+    for row, adjusted_probability in zip(
+        pairwise_results,
+        adjusted,
+    ):
+        row["FDR-BH Adjusted Tail Probability"] = (
+            float(adjusted_probability)
+        )
+
+        row["95% CI Excludes Zero"] = (
+            row["95% CI Lower"] > 0
+            or row["95% CI Upper"] < 0
+        )
+
+    return pairwise_results, model_performance
     
 # =========================================================================================    
 # Data Helpers
@@ -756,20 +935,15 @@ def train_and_evaluate_cil_model(
     epochs=5, num_tasks=5, base_lr=0.001, later_task_lr_factor=0.1,
     device='cpu', verbose=False, throughput_warmup_batches=0,
 ):
-    score_names = ("Macro F1", "Micro F1", "Weighted F1")
     model = cil_model.model.to(device)
-    baseline_accuracy = 0.0
     eval_matrices = {
-        score_name: np.zeros((num_tasks, num_tasks))
-        for score_name in score_names
+        "Micro F1": np.zeros((num_tasks, num_tasks))
     }
     forward_eval_matrices = {
-        score_name: np.full((num_tasks, num_tasks), np.nan)
-        for score_name in score_names
+        "Micro F1": np.full((num_tasks, num_tasks), np.nan)
     }
     baseline_forward_scores = {
-        score_name: np.zeros(num_tasks)
-        for score_name in score_names
+        "Micro F1": np.zeros(num_tasks)
     }
     task_throughput = []
     model_name = model.__class__.__name__ if hasattr(model, '__class__') else 'Unknown'
@@ -784,8 +958,7 @@ def train_and_evaluate_cil_model(
             loss_fn,
             apply_class_masking=False,
         )
-        for score_name in score_names:
-            baseline_forward_scores[score_name][t] = baseline_metrics[score_name]
+        baseline_forward_scores["Micro F1"][t] = baseline_metrics["Micro F1"]
     
     # Iterate pseudo-time training tasks
     for i in range(num_tasks):
@@ -806,8 +979,7 @@ def train_and_evaluate_cil_model(
                 loss_fn,
                 apply_class_masking=False,
             )
-            for score_name in score_names:
-                forward_eval_matrices[score_name][i, i - 1] = pre_task_metrics[score_name]
+            forward_eval_matrices["Micro F1"][i, i - 1] = pre_task_metrics["Micro F1"]
 
         current_lr = base_lr if i == 0 else base_lr * later_task_lr_factor
         optimizer = optimizer_cls(cil_model.model.parameters(), lr=current_lr)
@@ -830,11 +1002,8 @@ def train_and_evaluate_cil_model(
                 val_dataloaders[t],
                 loss_fn,
             )
-            for score_name in score_names:
-                eval_matrices[score_name][t, i] = val_metrics[score_name]
-            if i == 0:
-                baseline_accuracy = val_metrics["Macro F1"]
-            if verbose: print(f"    Task {t+1}: Macro F1 = {val_metrics['Macro F1']:.4f}")
+            eval_matrices["Micro F1"][t, i] = val_metrics["Micro F1"]
+            if verbose: print(f"    Task {t+1}: Micro F1 = {val_metrics['Micro F1']:.4f}")
         if verbose: print(f"    Exemplar set size = {cil_model.get_exemplar_count()}")
 
     aggregate_throughput = TrainingThroughput()
@@ -845,43 +1014,20 @@ def train_and_evaluate_cil_model(
         aggregate_throughput.timed_optimizer_steps += measurement.timed_optimizer_steps
         aggregate_throughput.optimization_seconds += measurement.optimization_seconds
 
-    macro_results = summarize_continual_metric_results(
-        eval_matrix=eval_matrices["Macro F1"],
-        forward_eval_matrix=forward_eval_matrices["Macro F1"],
-        baseline_forward_scores=baseline_forward_scores["Macro F1"],
-    )
     micro_results = summarize_continual_metric_results(
         eval_matrix=eval_matrices["Micro F1"],
         forward_eval_matrix=forward_eval_matrices["Micro F1"],
         baseline_forward_scores=baseline_forward_scores["Micro F1"],
-        suffix="Micro F1",
-    )
-    weighted_results = summarize_continual_metric_results(
-        eval_matrix=eval_matrices["Weighted F1"],
-        forward_eval_matrix=forward_eval_matrices["Weighted F1"],
-        baseline_forward_scores=baseline_forward_scores["Weighted F1"],
-        suffix="Weighted F1",
+        suffix="Micro F1"
     )
     full_val_loss, full_val_metrics = cil_model.evaluate(full_val_dataloader, loss_fn)
 
     results = {
-        **macro_results,
         **micro_results,
-        **weighted_results,
-        'AvgAcc Macro F1': macro_results['AvgAcc'],
-        'Backward Transfer Macro F1': macro_results['Backward Transfer'],
-        'Backward Transfer Per Task Macro F1': macro_results['Backward Transfer Per Task'],
-        'Forward Transfer Macro F1': macro_results['Forward Transfer'],
-        'Forward Transfer Per Task Macro F1': macro_results['Forward Transfer Per Task'],
-        'Task Forgetting List Macro F1': macro_results['Task Forgetting List'],
-        'Average Forgetting Macro F1': macro_results['Average Forgetting'],
-        'Eval Matrix Macro F1': macro_results['Eval Matrix'],
-        'Baseline Accuracy': baseline_accuracy,
         'Full Validation Loss': full_val_loss,
-        'Full Validation F1': full_val_metrics['Macro F1'],
         'Full Validation Macro F1': full_val_metrics['Macro F1'],
         'Full Validation Micro F1': full_val_metrics['Micro F1'],
-        'Full Validation Weighted F1': full_val_metrics['Weighted F1'],
+        'Full Validation Micro F1': full_val_metrics['Weighted F1'],
         'Training Throughput per Stage (samples/s)': [
             measurement.to_dict()['Training Throughput (samples/s)']
             for measurement in task_throughput
@@ -889,10 +1035,8 @@ def train_and_evaluate_cil_model(
         'Training Samples per Stage': [measurement.total_samples for measurement in task_throughput],
         'Timed Training Samples per Stage': [measurement.timed_samples for measurement in task_throughput],
         **aggregate_throughput.to_dict(),
-        'Num Parameters': sum(p.numel() for p in model.parameters()),
-        'Eval Matrix': macro_results['Eval Matrix']
     }
-
+    
     # Cleanup memory to prevent memory eating
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -948,7 +1092,6 @@ def train_final_cil_model(
         'Timed Training Samples per Stage': [measurement.timed_samples for measurement in task_throughput],
         **aggregate_throughput.to_dict(),
         'Final Exemplar Count': cil_model.get_exemplar_count(),
-        'Num Parameters': sum(parameter.numel() for parameter in cil_model.model.parameters()),
     }
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -1051,7 +1194,6 @@ def train_and_evaluate_control_models(
             'Validation Micro F1': metrics['Micro F1'],
             'Validation Weighted F1': metrics['Weighted F1'],
             'Training Time (s)': train_time,
-            'Num Parameters': sum(p.numel() for p in model.parameters()),
             'Train Dataset Size': len(train_dataloader.dataset),
             'Validation Dataset Size': len(val_dataloader.dataset),
         }
