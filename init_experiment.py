@@ -36,14 +36,14 @@ import torchvision.models as models
 import torchvision.transforms as transforms
 from torch.nn import CrossEntropyLoss, KLDivLoss
 from torch.optim import AdamW
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 
 from continual_learning import (
     CILComputerVisionModel,
     build_complete_dataloader,
     bootstrap_performance_diff,
+    measure_inference_throughput,
     serialize_save_json,
-    serialize_save_model_training,
     train_final_cil_model,
     train_and_evaluate_cil_model,
 )
@@ -131,19 +131,20 @@ class ExperimentConfig:
     run_seeds: tuple[int, ...] = (7,)
     cv_folds: int = 3
     cv_repeats: int = 1
-    cv_epochs: int = 4
-    final_run_seeds: tuple[int, ...] = (7, 17, 27)
+    cv_epochs: int = 8
+    final_run_seeds: tuple[int, ...] = (7, 17, 27, 37)
     throughput_warmup_batches: int = 3
+    realtime_inference_samples_per_class: int = 25
     dataset_name: str = "meowmeowmeowmeowmeow/gtsrb-german-traffic-sign"
     class_ids: tuple[int, ...] = DEFAULT_GTSRB_CLASSES
     validation_fraction: float = 0.20
     image_size: int = 224
-    batch_size: int = 256
+    batch_size: int = 128
     num_workers: int = 0
     pin_memory: bool | None = None
     persistent_workers: bool | None = None
     num_tasks: int = 3
-    epochs: int = 8
+    epochs: int = 10
     exemplar_ratio: float = 0.065
     task_1_lr: float = 0.001
     later_task_lr_factor: float = 0.1
@@ -190,6 +191,10 @@ class ExperimentConfig:
             raise ValueError("final_run_seeds must include unique seeds.")
         if self.throughput_warmup_batches < 0:
             raise ValueError("throughput_warmup_batches cannot be negative.")
+        if self.realtime_inference_samples_per_class < 1:
+            raise ValueError(
+                "realtime_inference_samples_per_class must be >= 1."
+    )
 
     @property
     def total_classes(self) -> int:
@@ -423,6 +428,46 @@ class DataBundle:
         return DataLoader(
             self.test_dataset,
             batch_size=self.config.batch_size,
+            collate_fn=collate_traffic_signs,
+            shuffle=False,
+            num_workers=self.config.num_workers,
+            pin_memory=self.config.resolved_pin_memory,
+            persistent_workers=self.config.resolved_persistent_workers,
+        )
+        
+    def real_time_inference_loader(self) -> DataLoader:
+        """ A pseudo-real data stream dataloader to measure practical inference time. """
+        rng = np.random.default_rng(self.config.seed)
+        
+        targets = np.array(
+            self.test_dataset.targets,
+            dtype=int
+        )
+        selected_indices = []
+        for class_id in sorted(np.unique(targets)):
+            class_indices = np.flatnonzero(
+                targets == class_id
+            )
+            n_samples = min(
+                self.config.realtime_inference_samples_per_class,
+                len(class_indices),
+            )
+            sampled_indices = rng.choice(
+                class_indices,
+                size=n_samples,
+                replace=False,
+            )
+            
+            selected_indices.extend(
+                sampled_indices.tolist()
+            )
+            
+        rng.shuffle(selected_indices)
+        limited_test_dataset = Subset(self.test_dataset, selected_indices)
+        
+        return DataLoader(
+            limited_test_dataset,
+            batch_size=1,
             collate_fn=collate_traffic_signs,
             shuffle=False,
             num_workers=self.config.num_workers,
@@ -1186,15 +1231,48 @@ def run_paired_component_tests(df: pd.DataFrame, component: str, baseline: str, 
     return result.sort_values([component, "Metric"]).reset_index(drop=True)
 
 
-def evaluate_checkpoint(checkpoint_path: str | Path, data: DataBundle, output_dir: str | Path | None = None) -> tuple[dict, CILComputerVisionModel]:
+def evaluate_checkpoint(
+    checkpoint_path: str | Path, 
+    data: DataBundle, 
+    output_dir: str | Path | None = None,
+    *,
+    inference_warmup_batches: int = 5,
+) -> tuple[dict, CILComputerVisionModel, np.ndarray, list[int]]:
     """Reconstruct and evaluate either new or archived checkpoints on the shared test set."""
     checkpoint_path = Path(checkpoint_path)
     model_name = strip_checkpoint_suffix(checkpoint_path.stem)
     seed_match = re.search(r"__seed-(\d+)$", checkpoint_path.stem)
+    
     model = build_model_from_name(model_name, data.config)
-    wrapper = CILComputerVisionModel.load(model, filename=str(checkpoint_path), map_location=data.config.resolved_device, device=data.config.resolved_device)
-    test_loss, test_metrics = wrapper.evaluate(data.test_loader(), data.loss_fn(), apply_class_masking=data.config.use_class_masking)
+    wrapper = CILComputerVisionModel.load(
+        model, 
+        filename=str(checkpoint_path), 
+        map_location=data.config.resolved_device, 
+        device=data.config.resolved_device
+    )
+    
+    test_loss, test_metrics, y_pred, y_true, _ = wrapper.evaluate(
+        data.test_loader(), 
+        data.loss_fn(), 
+        apply_class_masking=data.config.use_class_masking,
+        return_logits=True,
+    )
+    batch_inference_metrics = measure_inference_throughput(
+        model=wrapper.model, 
+        dataloader=data.test_loader(), 
+        device=data.config.resolved_device, 
+        warmup_batches=inference_warmup_batches
+    )
+    real_time_inference_metrics = measure_inference_throughput(
+        model=wrapper.model, 
+        dataloader=data.real_time_inference_loader(), 
+        device=data.config.resolved_device, 
+        warmup_batches=inference_warmup_batches*4
+    )
+    
     spec = build_model_specs(data.config)[model_name]
+    active_params, total_params, active_param_ratio = model.get_active_parameters()
+    
     result = {
         "Model": model_name,
         "Source Checkpoint": str(checkpoint_path),
@@ -1206,8 +1284,25 @@ def evaluate_checkpoint(checkpoint_path: str | Path, data: DataBundle, output_di
         "Test Macro F1": test_metrics["Macro F1"],
         "Test Micro F1": test_metrics["Micro F1"],
         "Test Weighted F1": test_metrics["Weighted F1"],
-        "Num Parameters": sum(parameter.numel() for parameter in wrapper.model.parameters()),
+        "Total Parameters": total_params,
+        "Active Parameters": active_params,
+        "Active Parameter Ratio": active_param_ratio,
     }
+    
+    result.update({
+        "Batch Inference Throughput (samples/s)":
+            batch_inference_metrics["Inference Throughput (samples/s)"],
+
+        "Batch Inference Latency (ms/sample)":
+            batch_inference_metrics["Inference Latency (ms/sample)"],
+
+        "Single-Image Inference Latency (ms)":
+            real_time_inference_metrics["Inference Latency (ms/sample)"],
+
+        "Single-Image Throughput (samples/s)":
+            real_time_inference_metrics["Inference Throughput (samples/s)"],
+    })
+    
     if seed_match:
         result["Final Seed"] = int(seed_match.group(1))
     result.update(collect_gre_metrics(wrapper, data.test_loader(), data.config, "Test"))
@@ -1215,18 +1310,29 @@ def evaluate_checkpoint(checkpoint_path: str | Path, data: DataBundle, output_di
         output_path = Path(output_dir) / f"test_{checkpoint_path.stem}.json"
         output_path.parent.mkdir(parents=True, exist_ok=True)
         serialize_save_json(result, str(output_path))
-    return result, wrapper
+    y_pred_classes = np.argmax(y_pred, axis=1) if y_pred.ndim == 2 else y_pred
+    return result, wrapper, y_pred_classes, y_true
 
 
-def evaluate_checkpoints(checkpoint_paths: Sequence[str | Path], data: DataBundle, output_dir: str | Path) -> tuple[pd.DataFrame, dict[str, nn.Module]]:
+def evaluate_checkpoints(checkpoint_paths: Sequence[str | Path], data: DataBundle, output_dir: str | Path) -> tuple[pd.DataFrame, dict[str, np.ndarray], np.ndarray | None]:
     rows: list[dict] = []
-    loaded_models: dict[str, nn.Module] = {}
+    model_predictions: dict[str, np.ndarray] = {}
+    all_targets: np.ndarray | None = None
+    
     for checkpoint_path in checkpoint_paths:
-        print(f"Evaluating {Path(checkpoint_path).name}...")
-        result, wrapper = evaluate_checkpoint(checkpoint_path, data, output_dir)
+        name = Path(checkpoint_path).stem
+        print(f"Evaluating {name}...")
+        result, wrapper, preds, targets = evaluate_checkpoint(checkpoint_path, data, output_dir)
         rows.append(result)
-        loaded_models[Path(checkpoint_path).stem] = wrapper.model
-    return pd.DataFrame(rows), loaded_models
+        model_predictions[name] = preds
+        if all_targets is None:
+            all_targets = np.array(targets)
+
+        del wrapper
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    return pd.DataFrame(rows), model_predictions, all_targets
 
 
 __all__ = [
