@@ -4,7 +4,7 @@ import json
 import time
 from dataclasses import dataclass
 from time import perf_counter
-from typing import Any, Callable, Literal, overload
+from typing import Any, Callable, Literal, cast, overload
 from itertools import combinations
 from collections import defaultdict
 from tqdm import tqdm
@@ -55,11 +55,57 @@ class TrainingThroughput:
                 else float("nan")
             ),
         }
+        
+        
+@dataclass
+class InferenceThroughput:
+    total_samples: int = 0
+    timed_samples: int = 0
+    timed_batches: int = 0
+    inference_seconds: float = 0.0
+
+    def record(self, batch_size: int, elapsed_seconds: float | None) -> None:
+        self.total_samples += batch_size
+
+        if elapsed_seconds is not None:
+            self.timed_samples += batch_size
+            self.timed_batches += 1
+            self.inference_seconds += elapsed_seconds
+
+    def to_dict(self) -> dict[str, float | int]:
+        samples_per_second = (
+            self.timed_samples / self.inference_seconds
+            if self.inference_seconds > 0
+            else float("nan")
+        )
+
+        ms_per_sample = (
+            1000.0 * self.inference_seconds / self.timed_samples
+            if self.timed_samples > 0
+            else float("nan")
+        )
+
+        ms_per_batch = (
+            1000.0 * self.inference_seconds / self.timed_batches
+            if self.timed_batches > 0
+            else float("nan")
+        )
+
+        return {
+            "Inference Samples": self.total_samples,
+            "Timed Inference Samples": self.timed_samples,
+            "Timed Inference Batches": self.timed_batches,
+            "Measured Inference Time (s)": self.inference_seconds,
+            "Inference Throughput (samples/s)": samples_per_second,
+            "Inference Latency (ms/sample)": ms_per_sample,
+            "Inference Latency (ms/batch)": ms_per_batch,
+        }
 
 
 def _synchronize_if_cuda(device: str) -> None:
     if str(device).startswith("cuda") and torch.cuda.is_available():
         torch.cuda.synchronize()
+
 
 class CILComputerVisionModel:
     """
@@ -105,7 +151,7 @@ class CILComputerVisionModel:
 
     def _get_model_aux_loss(self):
         # If this is a MoE model and has aux loss, return aux loss
-        if hasattr(self.model, "get_auxiliary_loss"):
+        if hasattr(self.model, "get_auxiliary_loss"): # TODO move to GRE
             aux_loss = self.model.get_auxiliary_loss()
             if aux_loss is not None:
                 return aux_loss
@@ -202,7 +248,7 @@ class CILComputerVisionModel:
             print("\rBuilding new task dataloader...", end="", flush=True)
         task_dataloader = self._build_task_dataloader(train_dataloader)
         if verbose:
-            print(f"\rTask dataloarder ready: {len(task_dataloader.dataset)} images in task.")
+            print(f"\rTask dataloarder ready: {len(task_dataloader.dataset)} images in task.")  # type: ignore
 
         measurement = TrainingThroughput()
         batch_number = 0
@@ -213,11 +259,7 @@ class CILComputerVisionModel:
 
             for images, labels, _ in progress_bar:
                 images = torch.stack(images).to(self.device)
-                y_true = torch.tensor(
-                    [l["label"] for l in labels],
-                    dtype=torch.long,
-                    device=self.device,
-                )
+                y_true = torch.stack([l["label"] for l in labels]).to(self.device)
 
                 measure_batch = batch_number >= throughput_warmup_batches
                 start_time = 0.0
@@ -246,7 +288,7 @@ class CILComputerVisionModel:
                 if verbose:
                     progress_bar.set_postfix({"loss": f"{loss_val.detach().item():.4f}"})
 
-        task_data_size = len(train_dataloader.dataset)
+        task_data_size = len(train_dataloader.dataset)  # type: ignore
         task_exemplar_size = int(self.exemplar_ratio * task_data_size)
 
         if task_exemplar_size > 0:
@@ -268,7 +310,7 @@ class CILComputerVisionModel:
                 )
 
         if hasattr(self.model, "reset_routing_state"):
-            # Reset GRE state to prevent copy errors
+            # Reset GRE state to prevent copy errors TODO move this to the GRE
             self.model.reset_routing_state()
 
         self.prev_model = copy.deepcopy(self.model).to(self.device)
@@ -317,11 +359,7 @@ class CILComputerVisionModel:
         with torch.no_grad():
             for images, labels, paths in test_dataloader:
                 images = torch.stack(images).to(self.device)
-                y_true = torch.tensor(
-                    [l["label"] for l in labels],
-                    dtype=torch.long,
-                    device=self.device,
-                )
+                y_true = torch.stack([l["label"] for l in labels]).to(self.device)
 
                 y_pred_logits = self.model(images)
                 eval_logits = (
@@ -395,6 +433,7 @@ class CILComputerVisionModel:
         if checkpoint['prev_model_state'] is not None:
             cil_object.prev_model = copy.deepcopy(model_instance).to(cil_object.device)
             cil_object.prev_model.load_state_dict(checkpoint['prev_model_state'])
+            cil_object.prev_model.eval()
             cil_object.prev_model.requires_grad_(False)
 
         cil_object.seen_classes         = checkpoint['seen_classes']
@@ -482,6 +521,71 @@ def forward_transfer_per_task(eval_matrix: np.ndarray, reference_scores: np.ndar
     baseline_scores = np.asarray(reference_scores)[1:]
 
     return pre_task_scores - baseline_scores
+
+
+def measure_inference_throughput(
+    model: nn.Module,
+    dataloader: DataLoader,
+    device: str,
+    *,
+    warmup_batches: int = 5,
+) -> dict[str, float | int]:
+    """
+    Measure model-only inference throughput on a fixed dataloader.
+    The timed region contains only the model forward pass.
+
+    Parameters
+    ----------
+    model : nn.Module
+        Model to benchmark.
+
+    dataloader : DataLoader
+        Runtime inference dataset.
+
+    device : str
+        Runtime inference compute type.
+
+    warmup_batches : int, default=5
+        Number of initial forward passes excluded from timing. This is
+        particularly important for CUDA kernels and memory allocation.
+
+    Returns
+    -------
+    dict
+        Throughput and latency measurements.
+    """
+    model = model.to(device)
+    model.eval()
+
+    measurement = InferenceThroughput()
+
+    with torch.inference_mode():
+        for batch_index, (images, _, _) in enumerate(dataloader):
+            images = torch.stack(images).to(
+                device,
+                non_blocking=True,
+            )
+
+            _synchronize_if_cuda(device)
+            measure_batch = batch_index >= warmup_batches
+            start_time = 0.0
+            if measure_batch:
+                start_time = perf_counter()
+            
+            _ = model(images)
+
+            _synchronize_if_cuda(device)
+            if measure_batch:
+                elapsed_seconds = perf_counter() - start_time
+            else:
+                elapsed_seconds = None
+
+            measurement.record(
+                batch_size=images.shape[0],
+                elapsed_seconds=elapsed_seconds,
+            )
+
+    return measurement.to_dict()
 
 
 def summarize_continual_metric_results(
@@ -619,13 +723,12 @@ def bootstrap_learning_diff(model_logits: dict, num_tasks, rng, resamples=1000):
     }
     
 def bootstrap_performance_diff(
-    test_dataloader,
-    models_dict,
-    device,
-    rng,
-    resamples=10_000,
-    average="macro",
-    stratified=True,
+    all_targets: np.ndarray,
+    model_preds: dict[str, np.ndarray],
+    rng: np.random.Generator,
+    resamples: int = 10_000,
+    average: Literal['micro', 'macro', 'weighted'] = "macro",
+    stratified: bool = True,
 ):
     """
     Paired nonparametric bootstrap comparison of trained models on one
@@ -637,72 +740,18 @@ def bootstrap_performance_diff(
     if resamples < 2:
         raise ValueError("resamples must be >= 2.")
 
-    if len(models_dict) < 2:
-        raise ValueError("At least two models are required.")
-
     if average not in {"macro", "micro", "weighted"}:
         raise ValueError(
             "average must be one of {'macro', 'micro', 'weighted'}."
         )
 
-    # ---------------------------------------------------------------
-    # 1. Run every model over exactly the same held-out examples.
-    # ---------------------------------------------------------------
-
-    all_targets = []
-    model_preds = {
-        name: []
-        for name in models_dict
-    }
-
-    for model in models_dict.values():
-        model.eval()
-
-    with torch.no_grad():
-        for images, labels, _ in test_dataloader:
-            images = torch.stack(images).to(device)
-
-            y_true = np.asarray(
-                [label["label"] for label in labels],
-                dtype=np.int64,
-            )
-
-            all_targets.extend(y_true.tolist())
-
-            for name, model in models_dict.items():
-                logits = model(images)
-                predictions = torch.argmax(logits, dim=1)
-
-                model_preds[name].extend(
-                    predictions.cpu().numpy().tolist()
-                )
-
-                if hasattr(model, "reset_routing_state"):
-                    model.reset_routing_state()
-
-    all_targets = np.asarray(all_targets, dtype=np.int64)
-
-    model_preds = {
-        name: np.asarray(predictions, dtype=np.int64)
-        for name, predictions in model_preds.items()
-    }
-
     n_samples = len(all_targets)
 
-    if n_samples == 0:
-        raise ValueError("The test dataloader produced no samples.")
-
-    for name, predictions in model_preds.items():
-        if len(predictions) != n_samples:
-            raise RuntimeError(
-                f"{name!r} produced {len(predictions)} predictions "
-                f"for {n_samples} targets."
-            )
-
-    # ---------------------------------------------------------------
-    # 2. Observed test-set F1.
-    # ---------------------------------------------------------------
-
+    model_preds = {
+        name: (np.argmax(predictions, axis=1) if predictions.ndim == 2 else predictions)
+        for name, predictions in model_preds.items()
+    }
+    
     observed_f1 = {
         name: f1_score(
             all_targets,
@@ -713,31 +762,22 @@ def bootstrap_performance_diff(
         for name, predictions in model_preds.items()
     }
 
-    # ---------------------------------------------------------------
-    # 3. Prepare stratified bootstrap index groups.
-    # ---------------------------------------------------------------
-
+    # Prepare stratified bootstrap index groups.
+    class_indices = None
     if stratified:
         class_indices = [
             np.flatnonzero(all_targets == class_id)
             for class_id in np.unique(all_targets)
         ]
-
+        
     bootstrap_f1 = {
         name: np.empty(resamples, dtype=np.float64)
-        for name in models_dict
+        for name in model_preds
     }
 
-    # ---------------------------------------------------------------
-    # 4. Paired bootstrap.
-    #
-    # Critically: one `indices` vector is generated per replicate and
-    # reused for every model.
-    # ---------------------------------------------------------------
-
+    # Paired bootstrap
     for bootstrap_index in range(resamples):
-
-        if stratified:
+        if class_indices is not None:
             indices = np.concatenate([
                 rng.choice(
                     indices_for_class,
@@ -747,10 +787,7 @@ def bootstrap_performance_diff(
                 for indices_for_class in class_indices
             ])
 
-            # Ordering is irrelevant to F1, but shuffling avoids leaving
-            # every bootstrap replicate class-block ordered.
             rng.shuffle(indices)
-
         else:
             indices = rng.choice(
                 n_samples,
@@ -770,10 +807,7 @@ def bootstrap_performance_diff(
                 zero_division=0,
             )
 
-    # ---------------------------------------------------------------
-    # 5. Per-model bootstrap summaries.
-    # ---------------------------------------------------------------
-
+    # Per-model bootstrap summaries.
     model_performance = []
 
     for name, samples in bootstrap_f1.items():
@@ -793,13 +827,10 @@ def bootstrap_performance_diff(
             "Bootstrap Resamples": resamples,
         })
 
-    # ---------------------------------------------------------------
-    # 6. Paired model differences.
-    # ---------------------------------------------------------------
-
+    # Paired model differences.
     pairwise_results = []
 
-    for name_a, name_b in combinations(models_dict.keys(), 2):
+    for name_a, name_b in combinations(model_preds.keys(), 2):
 
         bootstrap_delta = (
             bootstrap_f1[name_a]
@@ -816,17 +847,16 @@ def bootstrap_performance_diff(
             [2.5, 97.5],
         )
 
-        # Supplemental bootstrap sign/tail probability.
+        # Supplemental bootstrap sign/tail probability with tie-splitting.
         #
-        # +1 correction prevents a reported value of exactly zero when
-        # the number of bootstrap draws is finite.
-        lower_tail = (
-            np.count_nonzero(bootstrap_delta <= 0) + 1
-        ) / (resamples + 1)
+        # Ties (delta == 0) represent exact support for the null hypothesis H0: delta = 0.
+        # Splitting ties equally between tails ensures symmetric, unbiased p-values.
+        n_pos = np.count_nonzero(bootstrap_delta > 0)
+        n_neg = np.count_nonzero(bootstrap_delta < 0)
+        n_zero = np.count_nonzero(bootstrap_delta == 0)
 
-        upper_tail = (
-            np.count_nonzero(bootstrap_delta >= 0) + 1
-        ) / (resamples + 1)
+        lower_tail = (n_neg + 0.5 * n_zero + 1.0) / (resamples + 1.0)
+        upper_tail = (n_pos + 0.5 * n_zero + 1.0) / (resamples + 1.0)
 
         bootstrap_tail_probability = min(
             1.0,
@@ -845,10 +875,7 @@ def bootstrap_performance_diff(
             "Bootstrap Resamples": resamples,
         })
 
-    # ---------------------------------------------------------------
-    # 7. FDR correction over the COMPLETE pairwise family.
-    # ---------------------------------------------------------------
-
+    # FDR correction over the COMPLETE pairwise family.
     raw_tail_probabilities = np.asarray([
         row["Bootstrap Tail Probability"]
         for row in pairwise_results
@@ -1027,7 +1054,7 @@ def train_and_evaluate_cil_model(
         'Full Validation Loss': full_val_loss,
         'Full Validation Macro F1': full_val_metrics['Macro F1'],
         'Full Validation Micro F1': full_val_metrics['Micro F1'],
-        'Full Validation Micro F1': full_val_metrics['Weighted F1'],
+        'Full Validation Weighted F1': full_val_metrics['Weighted F1'],
         'Training Throughput per Stage (samples/s)': [
             measurement.to_dict()['Training Throughput (samples/s)']
             for measurement in task_throughput
@@ -1194,8 +1221,8 @@ def train_and_evaluate_control_models(
             'Validation Micro F1': metrics['Micro F1'],
             'Validation Weighted F1': metrics['Weighted F1'],
             'Training Time (s)': train_time,
-            'Train Dataset Size': len(train_dataloader.dataset),
-            'Validation Dataset Size': len(val_dataloader.dataset),
+            'Train Dataset Size': len(train_dataloader.dataset), # type: ignore
+            'Validation Dataset Size': len(val_dataloader.dataset), # type: ignore
         }
 
         print(
