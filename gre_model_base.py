@@ -123,12 +123,59 @@ class GeneralistRouterExperts(nn.Module):
         return (generalist_logits + experts_logits) / self.temperature
     
     def get_model_parameters_by_component(self):
+        """ 
+        Returns dictionary of parameter totals by submodel component.
+        Assumes experts are homogeneous, returning only the first experts total.
+        """
         return {
             'generalist': sum(p.numel() for p in self.generalist.parameters()),
             'router':     sum(p.numel() for p in self.router.parameters()),
-            'expert':     sum(p.numel() for p in self.experts[0].parameters()) * self.num_experts,
+            'expert':     sum(p.numel() for p in self.experts[0].parameters()),
         }
 
+    def get_trainable_parameters(self):
+        """
+        Get parameters that require gradients.
+
+        Returns
+        ----------
+            trainable : int
+                Number of parameters which use gradients.
+            total : int
+                Total number of parameters.
+            trainable_ratio : float
+                Percent of total parameters that are trainable.
+        """
+        trainable = 0
+        total = 0
+        for _, param in self.named_parameters():
+            total += param.numel()
+            if param.requires_grad == True:
+                trainable += param.numel()
+
+        return trainable, total, trainable / total
+    
+    def get_active_parameters(self):
+        """
+        Get parameters used during inference.
+        Assumes experts are homogeneous, showing total expert parameters and active
+        expert parameters based on the first expert.
+
+        Returns
+        ----------
+            active : int
+                Number of parameters used during inference.
+            total : int
+                Total number of parameters.
+            active_ratio : float
+                Percent of total parameters used during inference.
+        """
+        component_parameters = self.get_model_parameters_by_component()
+        total = component_parameters['generalist'] + component_parameters['router'] + component_parameters['expert'] * self.num_experts
+        active = component_parameters['generalist'] + component_parameters['router'] + component_parameters['expert'] * self.k
+        return active, total, active / total
+        
+        
 # =========================================================================================    
 # GRE Metrics
 # =========================================================================================
@@ -138,7 +185,7 @@ def expert_metrics(model: nn.Module, val_data: DataLoader, device='cpu'):
 
     model.eval()
     per_input_calls = []
-    expert_usage = torch.zeros(len(model.experts), dtype=torch.long)
+    expert_usage = torch.zeros(len(model.experts), dtype=torch.long) # type: ignore
 
     with torch.no_grad():
         for images, _, _ in val_data:
@@ -151,7 +198,7 @@ def expert_metrics(model: nn.Module, val_data: DataLoader, device='cpu'):
             )
             expert_usage += torch.bincount(
                 topk_indices.reshape(-1),
-                minlength=len(model.experts),
+                minlength=len(model.experts), # type: ignore
             )
 
     per_input_calls = torch.cat(per_input_calls)
@@ -181,30 +228,15 @@ def expected_calibration_error(
     with torch.no_grad():
         for images, labels, _ in val_data:
             images = torch.stack(images).to(device)
-            y_true = torch.tensor(
-                [l["label"] for l in labels],
-                dtype=torch.long,
-                device=device,
-            )
+            y_true = torch.stack([l["label"] for l in labels]).to(device)
             y_prob: torch.Tensor = torch.softmax(model(images), dim=1)
             ece.update(y_prob, y_true)
 
     return ece.compute().item()
 
-def trainable_parameters(model: nn.Module):
-    trainable = 0
-    total = 0
-    for _, param in model.named_parameters():
-        total += param.numel()
-        if param.requires_grad == True:
-            trainable += param.numel()
-
-    return trainable, total, trainable / total
-
 def router_entropy(model: nn.Module, val_data: DataLoader, device='cpu', eps=1e-12):
     """ 
     Measures how uncertain the gating model is across many inputs. 
-    TODO FIXME
     """
     result = {}
 
@@ -226,7 +258,7 @@ def router_entropy(model: nn.Module, val_data: DataLoader, device='cpu', eps=1e-
     all_entropies = torch.cat(all_entropies)
     avg_router_probs = torch.stack(avg_router_probs).mean(dim=0)
 
-    max_entropy = torch.log(torch.tensor(float(model.num_experts))).item()
+    max_entropy = torch.log(torch.tensor(float(model.num_experts))).item() # type: ignore
 
     result["Mean Router Entropy"] = all_entropies.mean().item()
     result["Normalized Router Entropy"] = all_entropies.mean().item() / max_entropy
