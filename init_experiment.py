@@ -1194,6 +1194,8 @@ def build_component_delta_table(df: pd.DataFrame, component: str, baseline: str,
 
 def run_paired_component_tests(df: pd.DataFrame, component: str, baseline: str, comparisons: Sequence[str], fixed_columns: Sequence[str], metrics: Sequence[str]) -> pd.DataFrame:
     metrics = [metric for metric in metrics if metric in df]
+    if baseline in comparisons:
+      comparisons = [name for name in comparisons if name != baseline]
     rows: list[dict] = []
     for comparison in comparisons:
         subset = df[df[component].isin((baseline, comparison))]
@@ -1218,7 +1220,19 @@ def run_paired_component_tests(df: pd.DataFrame, component: str, baseline: str, 
                     test = "Wilcoxon signed-rank"
                 except ValueError:
                     p_value, test = np.nan, "Wilcoxon unavailable"
-            rows.append({component: comparison, "Metric": metric, "Paired Configurations": len(deltas), f"Mean {baseline}": paired[baseline_key].mean(), f"Mean {comparison}": paired[comparison_key].mean(), "Mean Delta": deltas.mean(), "Median Delta": np.median(deltas), "Std Delta": deltas.std(ddof=0), "Raw P Value": p_value, "Test": test})
+            rows.append({
+                f"Comparison ({component})": comparison,
+                "Baseline": baseline,
+                "Metric": metric,
+                "Paired Configurations": len(deltas),
+                "Comparison Mean": paired[comparison_key].mean(),
+                "Baseline Mean": paired[baseline_key].mean(),
+                "Mean Delta (Comparison - Baseline)": deltas.mean(),
+                "Median Delta": np.median(deltas),
+                "Std Delta": deltas.std(ddof=0),
+                "Raw P Value": p_value,
+                "Test": test
+            })
     result = pd.DataFrame(rows)
     if result.empty:
         return result
@@ -1228,7 +1242,7 @@ def run_paired_component_tests(df: pd.DataFrame, component: str, baseline: str, 
         _, corrected, _, _ = multipletests(result.loc[valid, "Raw P Value"], method="fdr_bh")
         result.loc[valid, "FDR BH P Value"] = corrected
     result["Significant @ 0.05"] = result["FDR BH P Value"] < 0.05
-    return result.sort_values([component, "Metric"]).reset_index(drop=True)
+    return result.sort_values([f"Comparison ({component})", "Metric"]).reset_index(drop=True)
 
 
 def evaluate_checkpoint(
