@@ -1,0 +1,42 @@
+{
+    "Model": "JE ConvNeXt Tiny + Regression Router + Transformer Experts",
+    "Source Checkpoint": "/content/drive/MyDrive/is26_models/baseline_experiments/baseline_cil_protocol/models/JE ConvNeXt Tiny + Regression Router + Transformer Experts__seed-17.pth",
+    "Family": "Joint Embedding",
+    "Backbone": "JE ConvNeXt Tiny",
+    "Router": "Regression Router",
+    "Expert": "Transformer Experts",
+    "Test Loss": 0.08065506554253045,
+    "Test Macro F1": 0.9809462277196963,
+    "Test Micro F1": 0.9817142857142858,
+    "Test Weighted F1": 0.9817257261525235,
+    "Total Parameters": 28981023,
+    "Active Parameters": 28428283,
+    "Active Parameter Ratio": 0.9809275193632744,
+    "Batch Inference Throughput (samples/s)": 1240.8948619460034,
+    "Batch Inference Latency (ms/sample)": 0.805870046420995,
+    "Single-Image Inference Latency (ms)": 9.424816824403246,
+    "Single-Image Throughput (samples/s)": 106.10285787313616,
+    "Final Seed": 17,
+    "Test Router Entropy": 1.2272065877914429,
+    "Test Normalized Router Entropy": 0.6849170293102604,
+    "Test Router Entropy Std": 0.5300623774528503,
+    "Test Avg Router Prob": [
+        0.19926834106445312,
+        0.13977190852165222,
+        0.15107491612434387,
+        0.09737099707126617,
+        0.2837889492511749,
+        0.12872488796710968
+    ],
+    "Test ECE": 0.011531577445566654,
+    "Test Expected Expert Calls": 2.0,
+    "Test Expert Utilization Ratio": [
+        0.09314285963773727,
+        0.1777142882347107,
+        0.14190475642681122,
+        0.14838095009326935,
+        0.21085713803768158,
+        0.2280000001192093
+    ],
+    "Test Cost Proxy": 28428283.0
+}

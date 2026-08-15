@@ -1,0 +1,42 @@
+{
+    "Model": "JE ConvNeXt Tiny + MLP Router + MLP Experts",
+    "Source Checkpoint": "/content/drive/MyDrive/is26_models/baseline_experiments/baseline_cil_protocol/models/JE ConvNeXt Tiny + MLP Router + MLP Experts__seed-37.pth",
+    "Family": "Joint Embedding",
+    "Backbone": "JE ConvNeXt Tiny",
+    "Router": "MLP Router",
+    "Expert": "MLP Experts",
+    "Test Loss": 0.07238704210612923,
+    "Test Macro F1": 0.9810337278987551,
+    "Test Micro F1": 0.9815238095238096,
+    "Test Weighted F1": 0.9815856973974633,
+    "Total Parameters": 28489375,
+    "Active Parameters": 28353147,
+    "Active Parameter Ratio": 0.99521828751947,
+    "Batch Inference Throughput (samples/s)": 1275.1593888321277,
+    "Batch Inference Latency (ms/sample)": 0.7842156900212011,
+    "Single-Image Inference Latency (ms)": 8.470655721962762,
+    "Single-Image Throughput (samples/s)": 118.05461499364147,
+    "Final Seed": 37,
+    "Test Router Entropy": 1.4118269681930542,
+    "Test Normalized Router Entropy": 0.7879556242402049,
+    "Test Router Entropy Std": 0.3227314054965973,
+    "Test Avg Router Prob": [
+        0.18784630298614502,
+        0.2011590301990509,
+        0.1361912041902542,
+        0.21201692521572113,
+        0.1321902871131897,
+        0.13059623539447784
+    ],
+    "Test ECE": 0.004756535869091749,
+    "Test Expected Expert Calls": 2.0,
+    "Test Expert Utilization Ratio": [
+        0.14914286136627197,
+        0.14009523391723633,
+        0.16857142746448517,
+        0.24571429193019867,
+        0.18400000035762787,
+        0.11247619241476059
+    ],
+    "Test Cost Proxy": 28353147.0
+}

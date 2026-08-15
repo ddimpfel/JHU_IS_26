@@ -1,0 +1,42 @@
+{
+    "Model": "MobileNet Large + Regression Router + ResMLP Experts",
+    "Source Checkpoint": "/content/drive/MyDrive/is26_models/baseline_experiments/baseline_cil_protocol/models/MobileNet Large + Regression Router + ResMLP Experts__seed-37.pth",
+    "Family": "Baseline",
+    "Backbone": "MobileNet Large",
+    "Router": "Regression Router",
+    "Expert": "ResMLP Experts",
+    "Test Loss": 0.3242114369197571,
+    "Test Macro F1": 0.9049347819376801,
+    "Test Micro F1": 0.9022857142857142,
+    "Test Weighted F1": 0.9024984137511007,
+    "Total Parameters": 4142273,
+    "Active Parameters": 3371677,
+    "Active Parameter Ratio": 0.813967838430736,
+    "Batch Inference Throughput (samples/s)": 4711.987780785992,
+    "Batch Inference Latency (ms/sample)": 0.2122246590022339,
+    "Single-Image Inference Latency (ms)": 10.553958897528391,
+    "Single-Image Throughput (samples/s)": 94.7511743895637,
+    "Final Seed": 37,
+    "Test Router Entropy": 1.6583504676818848,
+    "Test Normalized Router Entropy": 0.9255430073302264,
+    "Test Router Entropy Std": 0.08646199107170105,
+    "Test Avg Router Prob": [
+        0.18291214108467102,
+        0.1517409086227417,
+        0.13132736086845398,
+        0.1901703029870987,
+        0.15149271488189697,
+        0.19235655665397644
+    ],
+    "Test ECE": 0.03074476309120655,
+    "Test Expected Expert Calls": 2.0,
+    "Test Expert Utilization Ratio": [
+        0.21285714209079742,
+        0.16342857480049133,
+        0.1027619019150734,
+        0.20647619664669037,
+        0.12409523874521255,
+        0.19038094580173492
+    ],
+    "Test Cost Proxy": 3371677.0
+}

@@ -1,0 +1,42 @@
+{
+    "Model": "ConvNeXt Tiny + Regression Router + ResMLP Experts",
+    "Source Checkpoint": "/content/drive/MyDrive/is26_models/baseline_experiments/baseline_cil_protocol/models/ConvNeXt Tiny + Regression Router + ResMLP Experts__seed-37.pth",
+    "Family": "Baseline",
+    "Backbone": "ConvNeXt Tiny",
+    "Router": "Regression Router",
+    "Expert": "ResMLP Experts",
+    "Test Loss": 0.14849558363979062,
+    "Test Macro F1": 0.9567577026673396,
+    "Test Micro F1": 0.9584761904761905,
+    "Test Weighted F1": 0.9586541917487389,
+    "Total Parameters": 28837791,
+    "Active Parameters": 28167035,
+    "Active Parameter Ratio": 0.9767403820909861,
+    "Batch Inference Throughput (samples/s)": 1232.2300040941768,
+    "Batch Inference Latency (ms/sample)": 0.8115368045555008,
+    "Single-Image Inference Latency (ms)": 8.801519297570094,
+    "Single-Image Throughput (samples/s)": 113.61674799441478,
+    "Final Seed": 37,
+    "Test Router Entropy": 1.7798595428466797,
+    "Test Normalized Router Entropy": 0.9933585125793327,
+    "Test Router Entropy Std": 0.010029408149421215,
+    "Test Avg Router Prob": [
+        0.16137325763702393,
+        0.16294986009597778,
+        0.1587093025445938,
+        0.1715237945318222,
+        0.17379002273082733,
+        0.17165377736091614
+    ],
+    "Test ECE": 0.011943185701966286,
+    "Test Expected Expert Calls": 2.0,
+    "Test Expert Utilization Ratio": [
+        0.15114285051822662,
+        0.1794285774230957,
+        0.0727619081735611,
+        0.12552380561828613,
+        0.28380951285362244,
+        0.18733333051204681
+    ],
+    "Test Cost Proxy": 28167035.0
+}

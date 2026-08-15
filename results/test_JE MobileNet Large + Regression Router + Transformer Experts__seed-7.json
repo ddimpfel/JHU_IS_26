@@ -1,0 +1,42 @@
+{
+    "Model": "JE MobileNet Large + Regression Router + Transformer Experts",
+    "Source Checkpoint": "/content/drive/MyDrive/is26_models/baseline_experiments/baseline_cil_protocol/models/JE MobileNet Large + Regression Router + Transformer Experts__seed-7.pth",
+    "Family": "Joint Embedding",
+    "Backbone": "JE MobileNet Large",
+    "Router": "Regression Router",
+    "Expert": "Transformer Experts",
+    "Test Loss": 0.18275559410297623,
+    "Test Macro F1": 0.9385247299659645,
+    "Test Micro F1": 0.94,
+    "Test Weighted F1": 0.9400448907454763,
+    "Total Parameters": 4183535,
+    "Active Parameters": 3630795,
+    "Active Parameter Ratio": 0.8678772855969892,
+    "Batch Inference Throughput (samples/s)": 4922.624301198764,
+    "Batch Inference Latency (ms/sample)": 0.20314367678973158,
+    "Single-Image Inference Latency (ms)": 10.845977956111112,
+    "Single-Image Throughput (samples/s)": 92.20007675163632,
+    "Final Seed": 7,
+    "Test Router Entropy": 1.211215615272522,
+    "Test Normalized Router Entropy": 0.6759922977268421,
+    "Test Router Entropy Std": 0.5209863185882568,
+    "Test Avg Router Prob": [
+        0.17528361082077026,
+        0.19057691097259521,
+        0.19053462147712708,
+        0.17633771896362305,
+        0.168671652674675,
+        0.09859547019004822
+    ],
+    "Test ECE": 0.01957003027200699,
+    "Test Expected Expert Calls": 2.0,
+    "Test Expert Utilization Ratio": [
+        0.13828571140766144,
+        0.22361904382705688,
+        0.1344761848449707,
+        0.13904762268066406,
+        0.18628571927547455,
+        0.17828571796417236
+    ],
+    "Test Cost Proxy": 3630795.0
+}
